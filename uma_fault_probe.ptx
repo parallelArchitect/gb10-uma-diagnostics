@@ -64,7 +64,7 @@
 
     // The load that may trigger migration
     // .cv = cache volatile, bypass L1/L2, force memory access
-    ld.global.cv.f32  %f1, [%rd5];
+    ld.global.cs.f32  %f1, [%rd5];
 
     // Read cycle counter AFTER the load
     mov.u64         %clock_after, %clock64;

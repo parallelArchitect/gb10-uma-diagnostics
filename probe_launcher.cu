@@ -305,7 +305,7 @@ static void write_json(const char *path,
     fprintf(f, "    \"cold_warm_ratio\": %.2f,\n", ratio);
     fprintf(f, "    \"platform_note\": \"%s\",\n", plat_note(p->type));
     fprintf(f, "    \"ptx_load_op\": "
-               "\"ld.global.cv (cache volatile, bypass all caches)\",\n");
+               "\"ld.global.cs (cache streaming, bypass L1)\",\n");
     fprintf(f, "    \"measurement\": \"%%clock64 before/after ld.global\"\n");
     fprintf(f, "  }\n");
     fprintf(f, "}\n");
@@ -335,7 +335,7 @@ int main(int argc, char **argv) {
         printf("Clock    : %d MHz\n", p.clock_mhz);
         printf("Buffer   : %d MB (%zu elements)\n",
                BUFFER_MB, (size_t)N_ELEMENTS);
-        printf("PTX op   : ld.global.cv (bypass all caches)\n");
+        printf("PTX op   : ld.global.cs (cache streaming, bypass L1)\n");
         printf("Measure  : %%clock64 before/after ld.global\n");
         printf("Note     : %s\n\n", plat_note(p.type));
     }

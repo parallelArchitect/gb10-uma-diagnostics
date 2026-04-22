@@ -176,6 +176,7 @@ static CUfunction load_ptx(const char *path, const char *fn, int sm_major, int s
     // Replace .version line
     char *v = strstr(src, ".version ");
     if (v) { char *eol = strchr(v, '\n'); if (eol) { int old_len = eol - v; int new_len = strlen(new_version); memmove(v + new_len, v + old_len, strlen(v + old_len) + 1); memcpy(v, new_version, new_len); } }
+    fprintf(stderr, "DEBUG PTX header: %.50s\n", src);
     CUmodule mod;
     CU_CHECK(cuModuleLoadData(&mod, src));
     free(src);

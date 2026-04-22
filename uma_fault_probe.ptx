@@ -1,7 +1,7 @@
 //
 // uma_fault_probe.ptx
 // UMA Page Fault Latency Probe for GB10 and discrete GPU platforms
-// Target: compute_60 (PTX portable — JIT compiled to native SASS by driver at runtime)
+// Target: sm_70 (PTX ISA 7.0 — JIT compiled to native SASS by driver at runtime)
 // Author: parallelArchitect
 //
 // What this measures:
@@ -10,8 +10,8 @@
 //   No CUPTI. No NVML. Ground truth from inside the kernel.
 //
 
-.version 6.0
-.target compute_60
+.version 7.0
+.target sm_70
 .address_size 64
 
 //

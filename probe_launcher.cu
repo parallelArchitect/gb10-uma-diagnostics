@@ -145,16 +145,33 @@ static void iso_ts(char *buf, size_t len) {
 }
 
 // --- Load PTX ---
-static CUfunction load_ptx(const char *path, const char *fn) {
+static CUfunction load_ptx(const char *path, const char *fn, int sm_major, int sm_minor) {
     FILE *f = fopen(path, "rb");
     if (!f) { fprintf(stderr, "Cannot open %s\n", path); exit(1); }
     fseek(f, 0, SEEK_END);
     long sz = ftell(f); rewind(f);
-    char *src = (char*)malloc(sz + 1);
+    char *src = (char*)malloc(sz + 64);
     size_t nr = fread(src, 1, sz, f);
     (void)nr;
     src[sz] = '\0';
     fclose(f);
+    // Patch .target and .version to match detected GPU at runtime
+    char sm_str[16], new_target[32], new_version[16];
+    snprintf(sm_str, sizeof(sm_str), "sm_%d%d", sm_major, sm_minor);
+    snprintf(new_target, sizeof(new_target), ".target %s", sm_str);
+    // PTX ISA version: sm_60-69->6.0, sm_70-79->7.0, sm_80-89->8.0, sm_90+->8.0, sm_120+->8.5
+    float ptx_ver = 6.0f;
+    if (sm_major >= 12) ptx_ver = 8.5f;
+    else if (sm_major >= 9)  ptx_ver = 8.0f;
+    else if (sm_major >= 8)  ptx_ver = 7.0f;
+    else if (sm_major >= 7)  ptx_ver = 6.3f;
+    snprintf(new_version, sizeof(new_version), ".version %.1f", ptx_ver);
+    // Replace .target line
+    char *t = strstr(src, ".target ");
+    if (t) { char *eol = strchr(t, '\n'); if (eol) { int old_len = eol - t; int new_len = strlen(new_target); memmove(t + new_len, t + old_len, strlen(t + old_len) + 1); memcpy(t, new_target, new_len); } }
+    // Replace .version line
+    char *v = strstr(src, ".version ");
+    if (v) { char *eol = strchr(v, '\n'); if (eol) { int old_len = eol - v; int new_len = strlen(new_version); memmove(v + new_len, v + old_len, strlen(v + old_len) + 1); memcpy(v, new_version, new_len); } }
     CUmodule mod;
     CU_CHECK(cuModuleLoadData(&mod, src));
     free(src);
@@ -361,7 +378,8 @@ int main(int argc, char **argv) {
 
     // Load PTX
     CUfunction kernel = load_ptx("uma_fault_probe.ptx",
-                                  "uma_fault_probe_kernel");
+                                  "uma_fault_probe_kernel",
+                                  p.sm_major, p.sm_minor);
 
     // Run passes
     PassResult cold, warm, pressure;

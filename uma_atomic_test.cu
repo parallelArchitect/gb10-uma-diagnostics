@@ -150,7 +150,11 @@ static CUfunction load_ptx_fn(const char *path, const char *fn, int sm_major, in
     src[sz] = '\0';
     fclose(f);
     char new_target[32], new_version[16];
-    snprintf(new_target, sizeof(new_target), ".target sm_%d%d", sm_major, sm_minor);
+    /* PTX target uses major only for SM 10+: sm_100, sm_120 etc */
+    if (sm_major >= 10)
+        snprintf(new_target, sizeof(new_target), ".target sm_%d0", sm_major);
+    else
+        snprintf(new_target, sizeof(new_target), ".target sm_%d%d", sm_major, sm_minor);
     float ptx_ver = 6.0f;
     if (sm_major >= 12) ptx_ver = 8.5f;
     else if (sm_major >= 9)  ptx_ver = 8.0f;

@@ -157,7 +157,11 @@ static CUfunction load_ptx(const char *path, const char *fn, int sm_major, int s
     fclose(f);
     // Patch .target and .version to match detected GPU at runtime
     char sm_str[16], new_target[32], new_version[16];
-    snprintf(sm_str, sizeof(sm_str), "sm_%d%d", sm_major, sm_minor);
+    /* PTX target uses major only for SM 10+: sm_100, sm_120 etc */
+    if (sm_major >= 10)
+        snprintf(sm_str, sizeof(sm_str), "sm_%d0", sm_major);
+    else
+        snprintf(sm_str, sizeof(sm_str), "sm_%d%d", sm_major, sm_minor);
     snprintf(new_target, sizeof(new_target), ".target %s", sm_str);
     // PTX ISA version: sm_60-69->6.0, sm_70-79->7.0, sm_80-89->8.0, sm_90+->8.0, sm_120+->8.5
     float ptx_ver = 6.0f;

@@ -71,8 +71,6 @@ The SYS/GPU ratio is the key signal:
 
 | Platform                      | Ratio  | Meaning                          |
 |-------------------------------|--------|----------------------------------|
-| Discrete PCIe (Pascal to Ada) | ~1.0x  | No coherence protocol            |
-| Hardware-coherent UMA (GB10)  | > 1.0x | NVLink-C2C coherence overhead    |
 
 On discrete GPUs, gpu-scope and sys-scope atomics typically have similar cost,
 as there is no system-level CPU–GPU coherence protocol to traverse.
@@ -160,7 +158,6 @@ Platform : DISCRETE_PCIE
 COLD  p50:     32.9 ns  (57 cycles)
 WARM  p50:     32.9 ns  (57 cycles)
 COLD/WARM ratio: 1.00x
-Expected : ratio ~1.0x (no HW fault visible on discrete GPU)
 ```
 
 **uma_bw:**
@@ -188,7 +185,6 @@ SYS-scope p50 :    177.1 ns  ( 307 cycles) [atom.global.sys]
 CONTENTION p50:    180.6 ns  ( 313 cycles) [sys + CPU concurrent]
 SYS/GPU ratio : 1.01x
 Coherence cost: 1.2 ns overhead
-Expected : ratio ~1.0x (no coherence protocol on discrete GPU)
 ```
 
 ---
@@ -207,10 +203,8 @@ Expected GB10 values based on architecture:
 
 | Tool       | Metric          | Expected                                              |
 |------------|-----------------|-------------------------------------------------------|
-| uma_probe  | COLD/WARM ratio | ~1.0x on GB10 (hardware coherent UMA, no page fault overhead measured) |
 | uma_bw     | GPU read        | community data needed (memory clock N/A from driver)  |
 | uma_bw     | CPU read        | 50-100 GB/s (native Grace CPU access, not PCIe)       |
-| uma_atomic | SYS/GPU ratio   | > 1.0x (NVLink-C2C coherence cost, unquantified)      |
 
 ---
 

@@ -1,26 +1,26 @@
 /*
  * uma_atomic_test.cu
- * UMA Atomic Coherence Latency Probe v1.0 — Host Launcher
+ * UMA Atomic Coherence Latency Probe v1.1.0
  *
  * Measures cycle-accurate latency of GPU-scope vs system-scope atomics
  * on unified managed memory. The delta between gpu-scope and sys-scope
  * is the NVLink-C2C coherence protocol cost on GB10.
  *
  * On discrete PCIe (Pascal to Ada): gpu-scope ~= sys-scope (~1.0x ratio)
- * On hardware-coherent UMA (GB10):  sys-scope >> gpu-scope (coherence cost)
+ * On hardware-coherent UMA (GB10):  sys-scope may differ from gpu-scope
  *
- * PTX kernel: uma_atomic_probe.ptx (must be in same directory)
+ * Inline PTX kernels — no PTX files, no runtime JIT, works on all SM versions.
+ * nvcc compiles inline PTX natively for the target GPU.
  *
  * Build:
- *   x86_64:  nvcc -O2 -std=c++17 uma_atomic_test.cu -o uma_atomic -lcudart -lcuda
- *   aarch64: nvcc -O2 -std=c++17 uma_atomic_test.cu -o uma_atomic -lcudart -lcuda -lpthread
+ *   nvcc -O2 -std=c++17 -arch=sm_60 uma_atomic_test.cu -o uma_atomic -lcudart -lcuda -lpthread
+ *   (SM 6.0+ required for scoped atomics)
  *
  * Run:
  *   ./uma_atomic
  *   ./uma_atomic --json-only
  */
 
-#include <cuda.h>
 #include <cuda_runtime.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -32,8 +32,8 @@
 #include <algorithm>
 #include <vector>
 
-#define TOOL_VERSION    "1.0.0"
-#define N_ELEMENTS      (1024 * 64)   /* 64K elements — fits in L2 on all targets */
+#define TOOL_VERSION    "1.1.0"
+#define N_ELEMENTS      (1024 * 64)   /* 64K elements */
 #define THREADS_PER_BLK 256
 #define WARMUP_RUNS     3
 #define MEASURE_RUNS    5
@@ -48,18 +48,8 @@
     } \
 } while(0)
 
-#define CU_CHECK(call) do { \
-    CUresult r = (call); \
-    if (r != CUDA_SUCCESS) { \
-        const char *s; cuGetErrorString(r, &s); \
-        fprintf(stderr, "CU error %s:%d: %s\n", \
-                __FILE__, __LINE__, s); \
-        exit(1); \
-    } \
-} while(0)
-
 /* ------------------------------------------------------------------ */
-/* Platform detection — same logic as uma_probe and uma_bw             */
+/* Platform detection                                                   */
 /* ------------------------------------------------------------------ */
 
 typedef enum {
@@ -116,6 +106,62 @@ static const char *plat_name(PlatformType t) {
 }
 
 /* ------------------------------------------------------------------ */
+/* Kernels — inline PTX, nvcc compiles natively for target SM          */
+/* ------------------------------------------------------------------ */
+
+/*
+ * GPU-scope atomic: atom.global.gpu.add.u32
+ * Stays within GPU memory system — no coherence protocol.
+ * Baseline atomic cost.
+ */
+__global__ void uma_atomic_gpu_kernel(
+    uint32_t * __restrict__ data,
+    uint64_t * __restrict__ latency,
+    uint64_t n)
+{
+    uint64_t tid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= n) return;
+
+    uint32_t *ptr = data + tid;
+    uint32_t result;
+
+    uint64_t t0 = clock64();
+    /* atom.global.gpu: GPU-scope atomic add, no coherence protocol */
+    asm volatile("atom.global.gpu.add.u32 %0, [%1], 1;"
+                 : "=r"(result) : "l"(ptr) : "memory");
+    uint64_t t1 = clock64();
+
+    (void)result;
+    latency[tid] = t1 - t0;
+}
+
+/*
+ * System-scope atomic: atom.global.sys.add.u32
+ * Traverses coherence protocol — on GB10 this crosses NVLink-C2C.
+ * The delta vs gpu-scope is the coherence overhead.
+ */
+__global__ void uma_atomic_sys_kernel(
+    uint32_t * __restrict__ data,
+    uint64_t * __restrict__ latency,
+    uint64_t n)
+{
+    uint64_t tid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= n) return;
+
+    uint32_t *ptr = data + tid;
+    uint32_t result;
+
+    uint64_t t0 = clock64();
+    /* atom.global.sys: system-scope atomic add, traverses coherence protocol */
+    asm volatile("atom.global.sys.add.u32 %0, [%1], 1;"
+                 : "=r"(result) : "l"(ptr) : "memory");
+    uint64_t t1 = clock64();
+
+    (void)result;
+    latency[tid] = t1 - t0;
+}
+
+/* ------------------------------------------------------------------ */
 /* Stats                                                                */
 /* ------------------------------------------------------------------ */
 
@@ -129,6 +175,11 @@ static double cycles_to_ns(double cycles, int mhz) {
     return cycles / (double)mhz * 1000.0;
 }
 
+static void iso_ts(char *buf, size_t len) {
+    time_t t = time(NULL);
+    strftime(buf, len, "%Y-%m-%dT%H:%M:%SZ", gmtime(&t));
+}
+
 typedef struct {
     double p50_ns, p90_ns, p99_ns, min_ns, max_ns;
     double p50_cyc;
@@ -136,74 +187,52 @@ typedef struct {
 } PassResult;
 
 /* ------------------------------------------------------------------ */
-/* PTX loader                                                           */
+/* CPU contention thread                                                */
 /* ------------------------------------------------------------------ */
 
-static CUfunction load_ptx_fn(const char *path, const char *fn, int sm_major, int sm_minor) {
-    FILE *f = fopen(path, "rb");
-    if (!f) { fprintf(stderr, "Cannot open %s\n", path); exit(1); }
-    fseek(f, 0, SEEK_END);
-    long sz = ftell(f); rewind(f);
-    char *src = (char*)malloc(sz + 64);
-    size_t nr = fread(src, 1, sz, f);
-    (void)nr;
-    src[sz] = '\0';
-    fclose(f);
-    char new_target[32], new_version[16];
-    /* PTX target uses major only for SM 10+: sm_100, sm_120 etc */
-    if (sm_major >= 10)
-        snprintf(new_target, sizeof(new_target), ".target sm_%d0", sm_major);
-    else
-        snprintf(new_target, sizeof(new_target), ".target sm_%d%d", sm_major, sm_minor);
-    float ptx_ver = 6.0f;
-    if (sm_major >= 12) ptx_ver = 8.5f;
-    else if (sm_major >= 9)  ptx_ver = 8.0f;
-    else if (sm_major >= 8)  ptx_ver = 7.0f;
-    else if (sm_major >= 7)  ptx_ver = 6.3f;
-    snprintf(new_version, sizeof(new_version), ".version %.1f", ptx_ver);
-    char *t = strstr(src, ".target ");
-    if (t) { char *eol = strchr(t, '\n'); if (eol) { int ol = eol-t; int nl = strlen(new_target); memmove(t+nl, t+ol, strlen(t+ol)+1); memcpy(t, new_target, nl); } }
-    char *v = strstr(src, ".version ");
-    if (v) { char *eol = strchr(v, '\n'); if (eol) { int ol = eol-v; int nl = strlen(new_version); memmove(v+nl, v+ol, strlen(v+ol)+1); memcpy(v, new_version, nl); } }
-    CUmodule mod;
-    CU_CHECK(cuModuleLoadData(&mod, src));
-    free(src);
-    CUfunction func;
-    CU_CHECK(cuModuleGetFunction(&func, mod, fn));
-    return func;
+typedef struct {
+    uint32_t *data;
+    size_t    n;
+    volatile int stop;
+} CpuArg;
+
+static void *cpu_contention_fn(void *arg) {
+    CpuArg *a = (CpuArg *)arg;
+    uint32_t *data = a->data;
+    size_t n = a->n;
+    while (!a->stop) {
+        for (size_t i = 0; i < n && !a->stop; i++)
+            __atomic_fetch_add(&data[i], 1, __ATOMIC_SEQ_CST);
+    }
+    return NULL;
 }
 
 /* ------------------------------------------------------------------ */
 /* Run one pass                                                         */
 /* ------------------------------------------------------------------ */
 
-static PassResult run_pass(CUfunction kernel,
-                           uint32_t *data, uint64_t *lat,
-                           size_t n, int clock_mhz,
-                           int device, int prefetch_to_gpu) {
-    /* Reset data and latency arrays */
+static PassResult run_pass_gpu(uint32_t *data, uint64_t *lat,
+                                size_t n, int clock_mhz,
+                                int device, int prefetch_to_gpu,
+                                bool use_sys_scope) {
     CUDA_CHECK(cudaMemset(data, 0, n * sizeof(uint32_t)));
     CUDA_CHECK(cudaMemset(lat,  0, n * sizeof(uint64_t)));
 
     if (prefetch_to_gpu) {
-        #if CUDART_VERSION >= 12020
-        cudaMemLocation loc1 = {cudaMemLocationTypeDevice, device};
-        CUDA_CHECK(cudaMemPrefetchAsync(data,
-                   n * sizeof(uint32_t), loc1, 0));
+#if CUDART_VERSION >= 12020
+        cudaMemLocation loc = {cudaMemLocationTypeDevice, device};
+        CUDA_CHECK(cudaMemPrefetchAsync(data, n * sizeof(uint32_t), loc, 0));
 #else
-        CUDA_CHECK(cudaMemPrefetchAsync(data,
-                   n * sizeof(uint32_t), device, 0));
+        CUDA_CHECK(cudaMemPrefetchAsync(data, n * sizeof(uint32_t), device, 0));
 #endif
         CUDA_CHECK(cudaDeviceSynchronize());
     }
 
-    uint64_t ne = (uint64_t)n;
-    void *args[] = { &data, &lat, &ne };
     int blocks = (int)((n + THREADS_PER_BLK - 1) / THREADS_PER_BLK);
-
-    CU_CHECK(cuLaunchKernel(kernel, blocks, 1, 1,
-                            THREADS_PER_BLK, 1, 1,
-                            0, 0, args, NULL));
+    if (use_sys_scope)
+        uma_atomic_sys_kernel<<<blocks, THREADS_PER_BLK>>>(data, lat, (uint64_t)n);
+    else
+        uma_atomic_gpu_kernel<<<blocks, THREADS_PER_BLK>>>(data, lat, (uint64_t)n);
     CUDA_CHECK(cudaDeviceSynchronize());
 
     std::vector<uint64_t> host(n);
@@ -217,45 +246,19 @@ static PassResult run_pass(CUfunction kernel,
 
     PassResult r = {};
     if (valid.empty()) return r;
-
     r.samples = valid.size();
-    double raw_p50 = percentile(valid, 50.0);
-    double raw_p90 = percentile(valid, 90.0);
-    double raw_p99 = percentile(valid, 99.0);
-    r.p50_ns  = cycles_to_ns(raw_p50, clock_mhz);
-    r.p90_ns  = cycles_to_ns(raw_p90, clock_mhz);
-    r.p99_ns  = cycles_to_ns(raw_p99, clock_mhz);
+    r.p50_cyc = percentile(valid, 50.0);
+    r.p50_ns  = cycles_to_ns(percentile(valid, 50.0), clock_mhz);
+    r.p90_ns  = cycles_to_ns(percentile(valid, 90.0), clock_mhz);
+    r.p99_ns  = cycles_to_ns(percentile(valid, 99.0), clock_mhz);
     r.min_ns  = cycles_to_ns(valid.front(), clock_mhz);
     r.max_ns  = cycles_to_ns(valid.back(),  clock_mhz);
-    r.p50_cyc = raw_p50;
     return r;
 }
 
 /* ------------------------------------------------------------------ */
-/* CPU contention thread                                                */
+/* JSON writer                                                          */
 /* ------------------------------------------------------------------ */
-
-typedef struct { uint32_t *data; size_t n; volatile int stop; } CpuArg;
-
-static void *cpu_contention_fn(void *arg) {
-    CpuArg *a = (CpuArg *)arg;
-    uint32_t acc = 0;
-    while (!a->stop) {
-        for (size_t i = 0; i < a->n && !a->stop; i++)
-            acc += __atomic_fetch_add(&a->data[i], 1, __ATOMIC_SEQ_CST);
-    }
-    (void)acc;
-    return NULL;
-}
-
-/* ------------------------------------------------------------------ */
-/* JSON output                                                          */
-/* ------------------------------------------------------------------ */
-
-static void iso_ts(char *buf, size_t len) {
-    time_t t = time(NULL);
-    strftime(buf, len, "%Y-%m-%dT%H:%M:%SZ", gmtime(&t));
-}
 
 static void write_json(const char *path,
                        const Platform *p,
@@ -320,7 +323,7 @@ static void write_json(const char *path,
     fprintf(f, "    \"sys_gpu_ratio\": %.2f,\n", ratio);
     fprintf(f, "    \"platform_note\": \"%s\",\n",
             p->type == PLAT_HW_COHERENT_UMA ?
-            "HW_COHERENT_UMA: sys/gpu ratio > 1.0x expected — NVLink-C2C coherence cost." :
+            "HW_COHERENT_UMA: sys/gpu ratio measures NVLink-C2C coherence cost." :
             "DISCRETE_PCIE: sys/gpu ratio ~1.0x expected — no coherence protocol.");
     fprintf(f, "    \"coherence_overhead_ns\": %.1f\n",
             sys_scope->p50_ns - gpu_scope->p50_ns);
@@ -339,7 +342,6 @@ int main(int argc, char **argv) {
         if (strcmp(argv[i], "--json-only") == 0)
             json_only = 1;
 
-    CU_CHECK(cuInit(0));
     int device = 0;
     CUDA_CHECK(cudaSetDevice(device));
 
@@ -357,39 +359,24 @@ int main(int argc, char **argv) {
         printf("Elements : %d\n", N_ELEMENTS);
         printf("Warmup   : %d runs  Measure: %d runs\n",
                WARMUP_RUNS, MEASURE_RUNS);
+        printf("Kernel   : inline PTX atomics, nvcc native\n");
         printf("PTX gpu  : atom.global.gpu.add.u32\n");
         printf("PTX sys  : atom.global.sys.add.u32\n\n");
     }
 
-    /* Allocate managed memory */
     uint32_t *data = nullptr;
     uint64_t *lat  = nullptr;
     CUDA_CHECK(cudaMallocManaged(&data, N_ELEMENTS * sizeof(uint32_t)));
     CUDA_CHECK(cudaMallocManaged(&lat,  N_ELEMENTS * sizeof(uint64_t)));
-
-    /* Load PTX kernels */
-    CUfunction kernel_gpu = load_ptx_fn("uma_atomic_probe.ptx",
-                                         "uma_atomic_gpu_kernel",
-                                         p.sm_major, p.sm_minor);
-    CUfunction kernel_sys = load_ptx_fn("uma_atomic_probe.ptx",
-                                         "uma_atomic_sys_kernel",
-                                         p.sm_major, p.sm_minor);
 
     PassResult gpu_scope = {}, sys_scope = {}, contention = {};
 
     /* --- GPU-scope pass --- */
     if (verbose) { printf("GPU-scope pass (atom.global.gpu):\n"); fflush(stdout); }
     for (int i = 0; i < WARMUP_RUNS; i++)
-        run_pass(kernel_gpu, data, lat, N_ELEMENTS,
-                 p.clock_mhz, device, 1);
-    /* Average over measure runs */
-    std::vector<double> p50s;
-    for (int i = 0; i < MEASURE_RUNS; i++) {
-        PassResult r = run_pass(kernel_gpu, data, lat, N_ELEMENTS,
-                                p.clock_mhz, device, 1);
-        p50s.push_back(r.p50_ns);
-        gpu_scope = r;
-    }
+        run_pass_gpu(data, lat, N_ELEMENTS, p.clock_mhz, device, 1, false);
+    for (int i = 0; i < MEASURE_RUNS; i++)
+        gpu_scope = run_pass_gpu(data, lat, N_ELEMENTS, p.clock_mhz, device, 1, false);
     if (verbose)
         printf("  p50: %8.1f ns  p90: %8.1f ns  p99: %8.1f ns\n\n",
                gpu_scope.p50_ns, gpu_scope.p90_ns, gpu_scope.p99_ns);
@@ -397,13 +384,9 @@ int main(int argc, char **argv) {
     /* --- SYS-scope pass --- */
     if (verbose) { printf("SYS-scope pass (atom.global.sys):\n"); fflush(stdout); }
     for (int i = 0; i < WARMUP_RUNS; i++)
-        run_pass(kernel_sys, data, lat, N_ELEMENTS,
-                 p.clock_mhz, device, 1);
-    for (int i = 0; i < MEASURE_RUNS; i++) {
-        PassResult r = run_pass(kernel_sys, data, lat, N_ELEMENTS,
-                                p.clock_mhz, device, 1);
-        sys_scope = r;
-    }
+        run_pass_gpu(data, lat, N_ELEMENTS, p.clock_mhz, device, 1, true);
+    for (int i = 0; i < MEASURE_RUNS; i++)
+        sys_scope = run_pass_gpu(data, lat, N_ELEMENTS, p.clock_mhz, device, 1, true);
     if (verbose)
         printf("  p50: %8.1f ns  p90: %8.1f ns  p99: %8.1f ns\n\n",
                sys_scope.p50_ns, sys_scope.p90_ns, sys_scope.p99_ns);
@@ -411,8 +394,7 @@ int main(int argc, char **argv) {
     /* --- Contention pass: sys-scope atomic + concurrent CPU --- */
     if (verbose) { printf("CONTENTION pass (sys-scope + CPU concurrent):\n"); fflush(stdout); }
 
-    /* Prefetch half to GPU, leave half CPU-accessible */
-    #if CUDART_VERSION >= 12020
+#if CUDART_VERSION >= 12020
     cudaMemLocation loc2 = {cudaMemLocationTypeDevice, device};
     CUDA_CHECK(cudaMemPrefetchAsync(data,
                (N_ELEMENTS/2) * sizeof(uint32_t), loc2, 0));
@@ -429,13 +411,9 @@ int main(int argc, char **argv) {
     pthread_create(&tid, NULL, cpu_contention_fn, &cpu_arg);
 
     for (int i = 0; i < WARMUP_RUNS; i++)
-        run_pass(kernel_sys, data, lat, N_ELEMENTS,
-                 p.clock_mhz, device, 0);
-    for (int i = 0; i < MEASURE_RUNS; i++) {
-        PassResult r = run_pass(kernel_sys, data, lat, N_ELEMENTS,
-                                p.clock_mhz, device, 0);
-        contention = r;
-    }
+        run_pass_gpu(data, lat, N_ELEMENTS, p.clock_mhz, device, 0, true);
+    for (int i = 0; i < MEASURE_RUNS; i++)
+        contention = run_pass_gpu(data, lat, N_ELEMENTS, p.clock_mhz, device, 0, true);
 
     cpu_arg.stop = 1;
     pthread_join(tid, NULL);
@@ -462,7 +440,7 @@ int main(int argc, char **argv) {
         if (p.type == PLAT_DISCRETE_PCIE)
             printf("Expected : ratio ~1.0x (no coherence protocol on discrete GPU)\n");
         else if (p.type == PLAT_HW_COHERENT_UMA)
-            printf("Expected : ratio > 1.0x (NVLink-C2C coherence overhead on GB10)\n");
+            printf("Expected : ratio >= 1.0x (NVLink-C2C coherence cost on GB10)\n");
         printf("JSON     : %s\n", JSON_OUTPUT);
     }
 

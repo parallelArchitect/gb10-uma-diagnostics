@@ -402,8 +402,14 @@ int main(int argc, char **argv) {
     CUDA_CHECK(cudaMemPrefetchAsync(data,
                (N_ELEMENTS/2) * sizeof(uint32_t), device, 0));
 #endif
+#if CUDART_VERSION >= 12020
+    cudaMemLocation loc_cpu = {cudaMemLocationTypeHost, 0};
+    CUDA_CHECK(cudaMemPrefetchAsync(data + N_ELEMENTS/2,
+               (N_ELEMENTS/2) * sizeof(uint32_t), loc_cpu, 0));
+#else
     CUDA_CHECK(cudaMemPrefetchAsync(data + N_ELEMENTS/2,
                (N_ELEMENTS/2) * sizeof(uint32_t), cudaCpuDeviceId, 0));
+#endif
     CUDA_CHECK(cudaDeviceSynchronize());
 
     CpuArg cpu_arg = { data, N_ELEMENTS, 0 };

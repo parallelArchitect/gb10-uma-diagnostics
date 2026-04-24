@@ -478,8 +478,13 @@ int main(int argc, char **argv) {
 
     /* --- CPU side --- */
     if (!json_only) printf("--- CPU (prefetched to CPU) ---\n");
+#if CUDART_VERSION >= 12020
+    cudaMemLocation loc_cpu1 = {cudaMemLocationTypeHost, 0};
+    CUDA_CHECK(cudaMemPrefetchAsync(buf_a, BUFFER_BYTES, loc_cpu1, 0));
+#else
     CUDA_CHECK(cudaMemPrefetchAsync(buf_a, BUFFER_BYTES,
                cudaCpuDeviceId, 0));
+#endif
     CUDA_CHECK(cudaDeviceSynchronize());
 
     for (int i = 0; i < WARMUP_RUNS; i++) cpu_read_bw(buf_a, n);
@@ -507,8 +512,14 @@ int main(int argc, char **argv) {
     CUDA_CHECK(cudaMemPrefetchAsync(buf_a,
                BUFFER_BYTES/2, device, 0));
 #endif
+#if CUDART_VERSION >= 12020
+    cudaMemLocation loc_cpu2 = {cudaMemLocationTypeHost, 0};
+    CUDA_CHECK(cudaMemPrefetchAsync(buf_a + n/2,
+               BUFFER_BYTES/2, loc_cpu2, 0));
+#else
     CUDA_CHECK(cudaMemPrefetchAsync(buf_a + n/2,
                BUFFER_BYTES/2, cudaCpuDeviceId, 0));
+#endif
     CUDA_CHECK(cudaDeviceSynchronize());
 
     CpuArg cpu_arg = { buf_a + n/2, n/2, 0.0 };

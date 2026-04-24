@@ -32,8 +32,11 @@
 #include <algorithm>
 #include <vector>
 
+/* Suppress nvcc warning 550: atomic output operand captured for timing only */
+#pragma diag_suppress 550
+
 #define TOOL_VERSION    "1.1.0"
-#define N_ELEMENTS      (1024 * 64)   /* 64K elements */
+#define N_ELEMENTS      (1024 * 64)
 #define THREADS_PER_BLK 256
 #define WARMUP_RUNS     3
 #define MEASURE_RUNS    5
@@ -47,10 +50,6 @@
         exit(1); \
     } \
 } while(0)
-
-/* ------------------------------------------------------------------ */
-/* Platform detection                                                   */
-/* ------------------------------------------------------------------ */
 
 typedef enum {
     PLAT_HW_COHERENT_UMA,
@@ -105,15 +104,6 @@ static const char *plat_name(PlatformType t) {
     }
 }
 
-/* ------------------------------------------------------------------ */
-/* Kernels — inline PTX, nvcc compiles natively for target SM          */
-/* ------------------------------------------------------------------ */
-
-/*
- * GPU-scope atomic: atom.global.gpu.add.u32
- * Stays within GPU memory system — no coherence protocol.
- * Baseline atomic cost.
- */
 __global__ void uma_atomic_gpu_kernel(
     uint32_t * __restrict__ data,
     uint64_t * __restrict__ latency,
@@ -123,23 +113,16 @@ __global__ void uma_atomic_gpu_kernel(
     if (tid >= n) return;
 
     uint32_t *ptr = data + tid;
-    uint32_t result;
+    uint32_t scratch;
 
     uint64_t t0 = clock64();
-    /* atom.global.gpu: GPU-scope atomic add, no coherence protocol */
     asm volatile("atom.global.gpu.add.u32 %0, [%1], 1;"
-                 : "=r"(result) : "l"(ptr) : "memory");
+                 : "=r"(scratch) : "l"(ptr) : "memory");
     uint64_t t1 = clock64();
-
-    (void)result;
-    latency[tid] = t1 - t0;
+    if (scratch == 0xDEADBEEF) latency[tid] = 0; /* never true, prevents optimization */
+    else latency[tid] = t1 - t0;
 }
 
-/*
- * System-scope atomic: atom.global.sys.add.u32
- * Traverses coherence protocol — on GB10 this crosses NVLink-C2C.
- * The delta vs gpu-scope is the coherence overhead.
- */
 __global__ void uma_atomic_sys_kernel(
     uint32_t * __restrict__ data,
     uint64_t * __restrict__ latency,
@@ -149,21 +132,15 @@ __global__ void uma_atomic_sys_kernel(
     if (tid >= n) return;
 
     uint32_t *ptr = data + tid;
-    uint32_t result;
+    uint32_t scratch;
 
     uint64_t t0 = clock64();
-    /* atom.global.sys: system-scope atomic add, traverses coherence protocol */
     asm volatile("atom.global.sys.add.u32 %0, [%1], 1;"
-                 : "=r"(result) : "l"(ptr) : "memory");
+                 : "=r"(scratch) : "l"(ptr) : "memory");
     uint64_t t1 = clock64();
-
-    (void)result;
-    latency[tid] = t1 - t0;
+    if (scratch == 0xDEADBEEF) latency[tid] = 0; /* never true, prevents optimization */
+    else latency[tid] = t1 - t0;
 }
-
-/* ------------------------------------------------------------------ */
-/* Stats                                                                */
-/* ------------------------------------------------------------------ */
 
 static double percentile(std::vector<uint64_t> &v, double pct) {
     if (v.empty()) return 0;
@@ -186,10 +163,6 @@ typedef struct {
     size_t samples;
 } PassResult;
 
-/* ------------------------------------------------------------------ */
-/* CPU contention thread                                                */
-/* ------------------------------------------------------------------ */
-
 typedef struct {
     uint32_t *data;
     size_t    n;
@@ -206,10 +179,6 @@ static void *cpu_contention_fn(void *arg) {
     }
     return NULL;
 }
-
-/* ------------------------------------------------------------------ */
-/* Run one pass                                                         */
-/* ------------------------------------------------------------------ */
 
 static PassResult run_pass_gpu(uint32_t *data, uint64_t *lat,
                                 size_t n, int clock_mhz,
@@ -256,10 +225,6 @@ static PassResult run_pass_gpu(uint32_t *data, uint64_t *lat,
     return r;
 }
 
-/* ------------------------------------------------------------------ */
-/* JSON writer                                                          */
-/* ------------------------------------------------------------------ */
-
 static void write_json(const char *path,
                        const Platform *p,
                        PassResult *gpu_scope,
@@ -286,7 +251,6 @@ static void write_json(const char *path,
     fprintf(f, "    \"clock_mhz\": %d,\n", p->clock_mhz);
     fprintf(f, "    \"n_elements\": %d\n", N_ELEMENTS);
     fprintf(f, "  },\n");
-
     fprintf(f, "  \"results\": {\n");
     fprintf(f, "    \"gpu_scope\": {\n");
     fprintf(f, "      \"ptx_op\": \"atom.global.gpu.add.u32\",\n");
@@ -297,7 +261,6 @@ static void write_json(const char *path,
     fprintf(f, "      \"p50_cycles\": %.0f, \"samples\": %zu\n",
             gpu_scope->p50_cyc, gpu_scope->samples);
     fprintf(f, "    },\n");
-
     fprintf(f, "    \"sys_scope\": {\n");
     fprintf(f, "      \"ptx_op\": \"atom.global.sys.add.u32\",\n");
     fprintf(f, "      \"p50_ns\": %.1f, \"p90_ns\": %.1f, \"p99_ns\": %.1f,\n",
@@ -307,7 +270,6 @@ static void write_json(const char *path,
     fprintf(f, "      \"p50_cycles\": %.0f, \"samples\": %zu\n",
             sys_scope->p50_cyc, sys_scope->samples);
     fprintf(f, "    },\n");
-
     fprintf(f, "    \"contention\": {\n");
     fprintf(f, "      \"ptx_op\": \"atom.global.sys.add.u32 + concurrent CPU __atomic_fetch_add\",\n");
     fprintf(f, "      \"p50_ns\": %.1f, \"p90_ns\": %.1f, \"p99_ns\": %.1f,\n",
@@ -318,23 +280,14 @@ static void write_json(const char *path,
             contention->p50_cyc, contention->samples);
     fprintf(f, "    }\n");
     fprintf(f, "  },\n");
-
     fprintf(f, "  \"interpretation\": {\n");
     fprintf(f, "    \"sys_gpu_ratio\": %.2f,\n", ratio);
-    fprintf(f, "    \"platform_note\": \"%s\",\n",
-            p->type == PLAT_HW_COHERENT_UMA ?
-            "HW_COHERENT_UMA: sys/gpu ratio measures NVLink-C2C coherence cost." :
-            "DISCRETE_PCIE: no coherence protocol.");
     fprintf(f, "    \"coherence_overhead_ns\": %.1f\n",
             sys_scope->p50_ns - gpu_scope->p50_ns);
     fprintf(f, "  }\n");
     fprintf(f, "}\n");
     fclose(f);
 }
-
-/* ------------------------------------------------------------------ */
-/* Main                                                                 */
-/* ------------------------------------------------------------------ */
 
 int main(int argc, char **argv) {
     int json_only = 0;
@@ -350,15 +303,12 @@ int main(int argc, char **argv) {
 
     if (verbose) {
         printf("=== UMA Atomic Coherence Probe v%s ===\n", TOOL_VERSION);
-        printf("GPU      : %s (SM %d.%d)\n",
-               p.name, p.sm_major, p.sm_minor);
+        printf("GPU      : %s (SM %d.%d)\n", p.name, p.sm_major, p.sm_minor);
         printf("Platform : %s\n", plat_name(p.type));
-        printf("Coherent : %s\n",
-               p.hw_coherent ? "yes (hardware)" : "no");
+        printf("Coherent : %s\n", p.hw_coherent ? "yes (hardware)" : "no");
         printf("Clock    : %d MHz\n", p.clock_mhz);
         printf("Elements : %d\n", N_ELEMENTS);
-        printf("Warmup   : %d runs  Measure: %d runs\n",
-               WARMUP_RUNS, MEASURE_RUNS);
+        printf("Warmup   : %d runs  Measure: %d runs\n", WARMUP_RUNS, MEASURE_RUNS);
         printf("Kernel   : inline PTX atomics, nvcc native\n");
         printf("PTX gpu  : atom.global.gpu.add.u32\n");
         printf("PTX sys  : atom.global.sys.add.u32\n\n");
@@ -371,7 +321,6 @@ int main(int argc, char **argv) {
 
     PassResult gpu_scope = {}, sys_scope = {}, contention = {};
 
-    /* --- GPU-scope pass --- */
     if (verbose) { printf("GPU-scope pass (atom.global.gpu):\n"); fflush(stdout); }
     for (int i = 0; i < WARMUP_RUNS; i++)
         run_pass_gpu(data, lat, N_ELEMENTS, p.clock_mhz, device, 1, false);
@@ -381,7 +330,6 @@ int main(int argc, char **argv) {
         printf("  p50: %8.1f ns  p90: %8.1f ns  p99: %8.1f ns\n\n",
                gpu_scope.p50_ns, gpu_scope.p90_ns, gpu_scope.p99_ns);
 
-    /* --- SYS-scope pass --- */
     if (verbose) { printf("SYS-scope pass (atom.global.sys):\n"); fflush(stdout); }
     for (int i = 0; i < WARMUP_RUNS; i++)
         run_pass_gpu(data, lat, N_ELEMENTS, p.clock_mhz, device, 1, true);
@@ -391,7 +339,6 @@ int main(int argc, char **argv) {
         printf("  p50: %8.1f ns  p90: %8.1f ns  p99: %8.1f ns\n\n",
                sys_scope.p50_ns, sys_scope.p90_ns, sys_scope.p99_ns);
 
-    /* --- Contention pass: sys-scope atomic + concurrent CPU --- */
     if (verbose) { printf("CONTENTION pass (sys-scope + CPU concurrent):\n"); fflush(stdout); }
 
 #if CUDART_VERSION >= 12020
@@ -428,7 +375,6 @@ int main(int argc, char **argv) {
         printf("  p50: %8.1f ns  p90: %8.1f ns  p99: %8.1f ns\n\n",
                contention.p50_ns, contention.p90_ns, contention.p99_ns);
 
-    /* --- Summary --- */
     if (verbose) {
         double ratio = (gpu_scope.p50_ns > 0) ?
                        sys_scope.p50_ns / gpu_scope.p50_ns : 0.0;

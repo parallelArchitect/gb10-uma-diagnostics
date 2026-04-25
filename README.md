@@ -312,6 +312,9 @@ continuously against that baseline and logs anomalies automatically.
 cuda-unified-memory-analyzer: https://github.com/parallelArchitect/cuda-unified-memory-analyzer
 sparkview: https://github.com/parallelArchitect/sparkview
 
+GB10 findings and community data:
+https://forums.developer.nvidia.com/t/gb10-hardware-baseline-first-direct-measurements-and-findings/367851
+
 ---
 
 ## License

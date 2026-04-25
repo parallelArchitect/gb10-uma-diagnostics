@@ -8,12 +8,11 @@ coherence cost using PTX instrumentation inside the kernel.
 All metrics are captured with `%clock64` and PTX cache/atomic scope
 operators — not CUPTI callbacks or NVML polling.
 
-Validated on discrete PCIe (Pascal SM 6.1). Designed for architectures
-through Blackwell GB10 (SM 12.1), covering both discrete PCIe and
-hardware-coherent UMA platforms.
+Validated on Pascal SM 6.1 (discrete PCIe) and Blackwell GB10 SM 12.1
+(hardware-coherent UMA). Covers both discrete PCIe and UMA platforms.
 
-Written in C and PTX. No dependencies beyond CUDA.
-Engineers share JSON output for remote analysis.
+Written in CUDA C with inline PTX. No separate PTX files.
+No dependencies beyond CUDA. Engineers share JSON output for remote analysis.
 
 ---
 
@@ -21,18 +20,19 @@ Engineers share JSON output for remote analysis.
 
 ### uma_probe — UMA Fault Latency Probe
 
-Measures cycle-accurate page fault latency using PTX `%clock64`
-before and after `ld.global.cv` on unified memory pages.
+Measures cycle-accurate memory access latency using `ld.global.cv` and
+`%clock64` inside the kernel.
 
 Three passes expose the full UMA behavior profile:
 
 | Pass     | Setup                      | Measures                        |
 |----------|----------------------------|---------------------------------|
-| COLD     | CPU touches all pages      | Hardware fault + migration cost |
+| COLD     | CPU touches all pages      | First-touch access cost         |
 | WARM     | GPU prefetch before launch | Resident access latency         |
 | PRESSURE | Mixed CPU/GPU residency    | Thrash latency                  |
 
 The COLD/WARM ratio is the key signal. Run the tool on your hardware — results vary by platform.
+
 ---
 
 ### uma_bw — UMA Bandwidth Test
@@ -67,29 +67,26 @@ Three passes:
 | SYS-scope  | `atom.global.sys.add.u32` | Atomic latency through coherence path |
 | CONTENTION | `atom.global.sys` + CPU   | True concurrent access cost           |
 
-The SYS/GPU ratio is the key signal:
-
-| Platform                      | Ratio  | Meaning                          |
-|-------------------------------|--------|----------------------------------|
-
-On discrete GPUs, gpu-scope and sys-scope atomics typically have similar cost,
-as there is no system-level CPU–GPU coherence protocol to traverse.
-On GB10, sys-scope atomics must coordinate with the Grace CPU through NVLink-C2C.
-The latency delta reflects coherence protocol overhead — not publicly quantified.
+The SYS/GPU ratio measures coherence protocol overhead.
+On GB10, sys-scope atomics traverse NVLink-C2C between Grace CPU and Blackwell GPU.
 
 ---
 
 ## Why PTX
 
 PTX (Parallel Thread Execution) is NVIDIA's virtual machine assembly.
-Targeting `compute_60` allows driver JIT compilation into native SASS
-for whatever GPU is present at runtime.
+Inline PTX inside CUDA C is compiled natively by nvcc for the target GPU —
+no separate PTX files, no runtime JIT.
 
-- One binary runs from Pascal through GB10
 - `%clock64` measures cycles inside the kernel, no driver overhead
-- Cache operators `.cg` and `.cs` control DRAM path behavior
+- Cache operators `.cg` and `.cv` control memory path behavior
+- `st.global.cs` bypasses L2, measuring true DRAM write bandwidth
 - Atomic scope operators `.gpu` and `.sys` expose coherence behavior
 - Ground truth from inside the kernel — not from callbacks
+
+Note: Nsight Systems UVM profiling is not supported on GB10 (confirmed by NVIDIA).
+These tools provide the ground truth measurements that no profiler currently
+offers on this platform.
 
 [NVIDIA PTX ISA Reference](https://docs.nvidia.com/cuda/parallel-thread-execution/)
 
@@ -122,11 +119,11 @@ nvcc -O2 -std=c++17 uma_bandwidth_test.cu -o uma_bw -lcudart -lpthread
 ### uma_atomic
 
 ```bash
-# x86_64:
-nvcc -O2 -std=c++17 uma_atomic_test.cu -o uma_atomic -lcudart -lcuda
+# x86_64 (SM 6.0+ required for scoped atomics):
+nvcc -O2 -std=c++17 -arch=sm_60 uma_atomic_test.cu -o uma_atomic -lcudart -lcuda
 
 # aarch64 (GB10 DGX Spark):
-nvcc -O2 -std=c++17 uma_atomic_test.cu -o uma_atomic -lcudart -lcuda -lpthread
+nvcc -O2 -std=c++17 -arch=sm_90 uma_atomic_test.cu -o uma_atomic -lcudart -lcuda -lpthread
 ```
 
 ---
@@ -144,9 +141,6 @@ nvcc -O2 -std=c++17 uma_atomic_test.cu -o uma_atomic -lcudart -lcuda -lpthread
 ./uma_atomic --json-only # JSON only
 ```
 
-`uma_fault_probe.ptx` must remain in the same directory as `uma_probe`.
-`uma_atomic_probe.ptx` must remain in the same directory as `uma_atomic`.
-
 ---
 
 ## Example Output — Pascal GTX 1080 (SM 6.1, validated)
@@ -155,69 +149,69 @@ nvcc -O2 -std=c++17 uma_atomic_test.cu -o uma_atomic -lcudart -lcuda -lpthread
 ```
 GPU      : NVIDIA GeForce GTX 1080 (SM 6.1)
 Platform : DISCRETE_PCIE
-COLD  p50:     32.9 ns  (57 cycles)
-WARM  p50:     32.9 ns  (57 cycles)
-COLD/WARM ratio: 1.00x
+COLD  p50:     49.0 ns  (85 cycles)
+WARM  p50:     46.2 ns  (80 cycles)
+COLD/WARM ratio: 1.06x
 ```
 
 **uma_bw:**
 ```
 GPU      : NVIDIA GeForce GTX 1080 (SM 6.1)
 Platform : DISCRETE_PCIE
-GPU read  : 248.91 GB/s  stddev 0.07
-GPU write : 254.16 GB/s  stddev 0.03  [PTX .cs]
-GPU copy  :   7.69 GB/s
-CPU read  :   5.23 GB/s  (PCIe bottleneck)
-CPU write :  22.69 GB/s
-Peak      : 320.32 GB/s  (derived from hardware: 256-bit bus, 5005 MHz)
+GPU read  : 254.90 GB/s  stddev 0.82
+GPU write : 261.69 GB/s  [PTX .cs]
+GPU copy  :   6.64 GB/s
+CPU read  :   5.23 GB/s
+CPU write :  18.26 GB/s
+Conc total: 264.16 GB/s
 ```
-
-Pascal note: PTX `.cs` (cache streaming, L2 bypass) is a hint, not a guarantee
-on SM 6.x. On Volta+ (SM 7.0+) `.cs` produces true DRAM write bandwidth.
-On GB10 (SM 12.1) write results will reflect true LPDDR5X bandwidth.
 
 **uma_atomic:**
 ```
 GPU      : NVIDIA GeForce GTX 1080 (SM 6.1)
 Platform : DISCRETE_PCIE
-GPU-scope p50 :    176.0 ns  ( 305 cycles) [atom.global.gpu]
-SYS-scope p50 :    177.1 ns  ( 307 cycles) [atom.global.sys]
-CONTENTION p50:    180.6 ns  ( 313 cycles) [sys + CPU concurrent]
-SYS/GPU ratio : 1.01x
-Coherence cost: 1.2 ns overhead
+GPU-scope p50 :    187.5 ns  (325 cycles) [atom.global.gpu]
+SYS-scope p50 :    187.5 ns  (325 cycles) [atom.global.sys]
+SYS/GPU ratio : 1.00x
+Coherence cost: 0.0 ns overhead
 ```
 
 ---
 
-## GB10 / DGX Spark — Community Data Needed
+## Example Output — GB10 DGX Spark (SM 12.1, validated)
 
-Developed from shared logs, sosreports, and PTX documentation.
-GB10 hardware access is not available to the author.
+First community measurement, 2026-04-23. VLLM loaded, model idle.
 
-If you have a DGX Spark, run all three tools and share the JSON
-output via the Issues page.
+**uma_probe:**
+```
+GPU      : NVIDIA GB10 (SM 12.1)
+Platform : HARDWARE_COHERENT_UMA
+COLD  p50:     16.5 ns  (40 cycles)
+WARM  p50:     16.5 ns  (40 cycles)
+COLD/WARM ratio: 1.00x
+```
 
-https://github.com/parallelArchitect/nvidia-uma-fault-probe/issues
+**uma_bw:**
+```
+GPU      : NVIDIA GB10 (SM 12.1)
+Platform : HARDWARE_COHERENT_UMA
+GPU read  : 161.31 GB/s  stddev 2.82
+GPU write : 116.15 GB/s  [PTX .cs]
+GPU copy  : 164.45 GB/s
+CPU read  :   7.62 GB/s
+CPU write :  57.95 GB/s
+Conc total: 162.89 GB/s
+```
 
-Expected GB10 values based on architecture:
-
-| Tool       | Metric          | Expected                                              |
-|------------|-----------------|-------------------------------------------------------|
-| uma_bw     | GPU read        | community data needed (memory clock N/A from driver)  |
-| uma_bw     | CPU read        | 50-100 GB/s (native Grace CPU access, not PCIe)       |
-
----
-
-## Relationship to cuda-unified-memory-analyzer
-
-This repository complements cuda-unified-memory-analyzer:
-https://github.com/parallelArchitect/cuda-unified-memory-analyzer
-
-| Tool                         | Measures                                | Method                      |
-|------------------------------|-----------------------------------------|-----------------------------|
-| uma_probe                    | Fault latency (ns)                      | PTX %clock64 + ld.global.cv |
-| uma_bw                       | Bandwidth (GB/s)                        | PTX .cg/.cs + CUDA events   |
-| uma_atomic                   | Atomic coherence latency (ns)           | PTX %clock64 + atom.global  |
+**uma_atomic:**
+```
+GPU      : NVIDIA GB10 (SM 12.1)
+Platform : HARDWARE_COHERENT_UMA
+GPU-scope p50 :      9.9 ns  (24 cycles) [atom.global.gpu]
+SYS-scope p50 :      9.9 ns  (24 cycles) [atom.global.sys]
+SYS/GPU ratio : 1.00x
+Coherence cost: 0.0 ns overhead
+```
 
 ---
 
@@ -231,8 +225,26 @@ https://github.com/parallelArchitect/cuda-unified-memory-analyzer
 | Ampere                     | 8.0, 8.6 | expected  | expected  | expected   |
 | Ada Lovelace               | 8.9      | expected  | expected  | expected   |
 | Hopper                     | 9.0      | expected  | expected  | expected   |
-| Blackwell GB10 (DGX Spark) | 12.1     | pending   | pending   | pending    |
+| Blackwell GB10 (DGX Spark) | 12.1     | validated | validated | validated  |
 | Blackwell GB202 (RTX 5090) | 12.0     | pending   | pending   | pending    |
+
+---
+
+## Relationship to Other Tools
+
+| Tool                          | Measures                      | Method                       | Type           |
+|-------------------------------|-------------------------------|------------------------------|----------------|
+| uma_probe                     | Memory access latency (ns)    | PTX %clock64 + ld.global.cv  | Point-in-time  |
+| uma_bw                        | Bandwidth (GB/s)              | PTX .cg/.cs + CUDA events    | Point-in-time  |
+| uma_atomic                    | Atomic coherence latency (ns) | PTX %clock64 + atom.global   | Point-in-time  |
+| cuda-unified-memory-analyzer  | UMA pressure, fault rate, migration efficiency | CUPTI + NVML (Pascal validated; GB10 in progress) | Point-in-time  |
+| sparkview                     | System health + UMA pressure  | NVML + PSI + clock state     | Continuous monitor |
+
+These tools establish the hardware baseline. sparkview monitors the system
+continuously against that baseline and logs anomalies automatically.
+
+cuda-unified-memory-analyzer: https://github.com/parallelArchitect/cuda-unified-memory-analyzer
+sparkview: https://github.com/parallelArchitect/sparkview
 
 ---
 

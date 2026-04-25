@@ -54,3 +54,16 @@ All notable changes to nvidia-uma-fault-probe are documented here.
   - GPU read: 248.91 GB/s
   - GPU write: 254.16 GB/s
 - GB10 / DGX Spark community data collection via Issues
+
+## v1.2.0 — 2026-04-24
+
+### Changed
+- uma_probe: CUDA C kernel with inline PTX ld.global.cv, no PTX files
+- uma_atomic: inline PTX scoped atomics, no PTX files (v1.1.0)
+- uma_bw: CUDA 13 compat verified, cudaCpuDeviceId guarded
+- All PTX files removed — nvcc compiles natively for target SM
+- CUDA 13 cudaMemPrefetchAsync API compat across all three tools
+
+### Validated
+- Pascal SM 6.1 (CUDA 12.0) — confirmed
+- Blackwell GB10 SM 12.1 (CUDA 13.0, driver 580.142) — confirmed

@@ -1,7 +1,8 @@
-uma_bw
+# Compiled binaries
 uma_probe
-*.json
-*.o
 uma_atomic
-uma_probe
 uma_bw
+
+# Result files
+*.zip
+uma_*_results.json

@@ -8,8 +8,7 @@ coherence cost using PTX instrumentation inside the kernel.
 All metrics are captured with `%clock64` and PTX cache/atomic scope
 operators — not CUPTI callbacks or NVML polling.
 
-Validated on Pascal SM 6.1 (discrete PCIe) and Blackwell GB10 SM 12.1
-(hardware-coherent UMA). Covers both discrete PCIe and UMA platforms.
+Covers both discrete PCIe and UMA platforms.
 
 Written in CUDA C with inline PTX. No separate PTX files.
 No dependencies beyond CUDA. Engineers share JSON output for remote analysis.
@@ -67,8 +66,11 @@ Three passes:
 | SYS-scope  | `atom.global.sys.add.u32` | Atomic latency through coherence path |
 | CONTENTION | `atom.global.sys` + CPU   | True concurrent access cost           |
 
-The SYS/GPU ratio measures coherence protocol overhead.
-On GB10, sys-scope atomics traverse NVLink-C2C between Grace CPU and Blackwell GPU.
+
+The SYS/GPU ratio is the coherence signal. On discrete PCIe 
+ratio is ~1.0x (no coherence protocol). On GB10 NVLink-C2C 
+hardware coherence is transparent — first community measurement 
+shows 1.00x ratio at atomic instruction level.
 
 ---
 
@@ -85,10 +87,13 @@ no separate PTX files, no runtime JIT.
 - Ground truth from inside the kernel — not from callbacks
 
 Note: Nsight Systems UVM profiling is not supported on GB10 (confirmed by NVIDIA).
-These tools provide the ground truth measurements that no profiler currently
-offers on this platform.
+These measurements provide direct visibility in its absence.
 
-[NVIDIA PTX ISA Reference](https://docs.nvidia.com/cuda/parallel-thread-execution/)
+References:
+- CUDA Programming Guide (Unified Memory model):
+  https://docs.nvidia.com/cuda/cuda-c-programming-guide/
+- PTX ISA (instruction-level measurement basis):
+  https://docs.nvidia.com/cuda/parallel-thread-execution/
 
 ---
 
@@ -140,6 +145,67 @@ nvcc -O2 -std=c++17 -arch=sm_90 uma_atomic_test.cu -o uma_atomic -lcudart -lcuda
 ./uma_atomic             # human-readable output + JSON log
 ./uma_atomic --json-only # JSON only
 ```
+
+---
+
+## Scripts
+
+### run_all.sh — Run All Tools
+
+Runs all three probes in sequence with thermal cooldown between each.
+
+```bash
+./run_all.sh
+```
+
+- Checks all binaries are built — exits with build instructions if not
+- Detects sparkview and launches it automatically for thermal monitoring
+- Runs uma_probe → 10s cooldown → uma_atomic → 10s cooldown → uma_bw → 30s cooldown
+- Calls collect_results.sh automatically when done
+
+If sparkview is already running when `run_all.sh` is launched, the script exits with:
+
+```
+sparkview is already running.
+Close it first for a clean session log, then rerun this script.
+```
+
+If sparkview is not installed:
+
+```
+sparkview not found — recommended for thermal monitoring.
+Install: https://github.com/parallelArchitect/sparkview
+```
+
+---
+
+### collect_results.sh — Package Results
+
+Packages all JSON result files plus the latest sparkview anomaly log.
+
+```bash
+./collect_results.sh
+```
+
+Creates `uma_results_<hostname>_<timestamp>.zip` containing:
+- `uma_probe_results.json`
+- `uma_bw_results.json`
+- `uma_atomic_results.json`
+- `sparkview_summary.json` (if sparkview logged an anomaly)
+- `sparkview_anomaly.log.gz` (if sparkview logged an anomaly)
+
+Prompts after packaging:
+
+```
+Results packaged: uma_results_mc_20260425_021713.zip (3 of 3 tools)
+
+What would you like to do?
+  [1] Share — open GitHub Issues to upload
+  [2] Local — keep results, no upload
+```
+
+To share results with the community:
+https://github.com/parallelArchitect/nvidia-uma-fault-probe/issues
 
 ---
 
@@ -247,14 +313,6 @@ cuda-unified-memory-analyzer: https://github.com/parallelArchitect/cuda-unified-
 sparkview: https://github.com/parallelArchitect/sparkview
 
 ---
-
-## Author
-
-Joe McLaren (parallelArchitect)
-Human-directed GPU engineering with AI assistance.
-
-Contact: gpu.validation@gmail.com
-https://github.com/parallelArchitect
 
 ## License
 

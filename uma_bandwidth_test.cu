@@ -29,6 +29,8 @@
 #include <time.h>
 #include <pthread.h>
 #include <math.h>
+#include "include/time_sync.h"
+#include "include/timeline.h"
 
 #define TOOL_VERSION      "2.0.0"
 #define BUFFER_GB         4
@@ -88,6 +90,9 @@ typedef struct {
     double conc_gpu;
     double conc_cpu;
     double conc_total;
+    double empirical_peak_gbps;
+    double bw_efficiency_pct;
+    char   peak_source[64];
 } Results;
 
 static double stat_mean(double *a, int n) {
@@ -344,7 +349,10 @@ static void write_json(const char *path,
     fprintf(f, "    \"cpu_write_gbs\":       %.2f,\n", r->cpu_write.mean);
     fprintf(f, "    \"concurrent_gpu_gbs\":  %.2f,\n", r->conc_gpu);
     fprintf(f, "    \"concurrent_cpu_gbs\":  %.2f,\n", r->conc_cpu);
-    fprintf(f, "    \"concurrent_total_gbs\": %.2f\n",  r->conc_total);
+    fprintf(f, "    \"concurrent_total_gbs\": %.2f,\n",  r->conc_total);
+    fprintf(f, "    \"empirical_peak_bw_gbps\": %.3f,\n", r->empirical_peak_gbps);
+    fprintf(f, "    \"bw_efficiency_pct\": %.1f,\n",       r->bw_efficiency_pct);
+    fprintf(f, "    \"peak_source\": \"%s\"\n",             r->peak_source);
     fprintf(f, "  },\n");
 
     fprintf(f, "  \"interpretation\": {\n");
@@ -381,17 +389,126 @@ static void write_json(const char *path,
 /* Main                                                                 */
 /* ------------------------------------------------------------------ */
 
+
+/* ------------------------------------------------------------------ */
+/* Peak bandwidth calibration — empirical, no spec constants           */
+/* ------------------------------------------------------------------ */
+
+static const size_t CAL_SIZES[] = {
+    64ULL  * 1024 * 1024,
+    128ULL * 1024 * 1024,
+    256ULL * 1024 * 1024,
+    512ULL * 1024 * 1024,
+    1024ULL * 1024 * 1024
+};
+static const int CAL_PASSES = 5;
+
+struct PeakCalibration {
+    double      empirical_peak_gbps;
+    const char *peak_source;
+    size_t      best_bytes;
+    int         best_pass;
+};
+
+static void write_peak_calibration_json(const char *path,
+                                         const PeakCalibration *cal) {
+    FILE *fp = fopen(path, "w");
+    if (!fp) return;
+    fprintf(fp, "{\n");
+    fprintf(fp, "  \"peak_source\": \"%s\",\n",          cal->peak_source);
+    fprintf(fp, "  \"empirical_peak_bw_gbps\": %.6f,\n", cal->empirical_peak_gbps);
+    fprintf(fp, "  \"best_bytes\": %zu,\n",               cal->best_bytes);
+    fprintf(fp, "  \"best_pass\": %d\n",                  cal->best_pass);
+    fprintf(fp, "}\n");
+    fclose(fp);
+}
+
+static double run_gpu_bandwidth_once(float *buf, size_t bytes) {
+    size_t n = bytes / sizeof(float);
+    int blocks = (int)((n + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK);
+    cudaEvent_t ev_s, ev_e;
+    CUDA_CHECK(cudaEventCreate(&ev_s));
+    CUDA_CHECK(cudaEventCreate(&ev_e));
+    CUDA_CHECK(cudaEventRecord(ev_s));
+    gpu_read_kernel<<<blocks, THREADS_PER_BLOCK>>>(buf, g_sink, n);
+    CUDA_CHECK(cudaEventRecord(ev_e));
+    CUDA_CHECK(cudaEventSynchronize(ev_e));
+    float ms = 0;
+    CUDA_CHECK(cudaEventElapsedTime(&ms, ev_s, ev_e));
+    CUDA_CHECK(cudaEventDestroy(ev_s));
+    CUDA_CHECK(cudaEventDestroy(ev_e));
+    return (double)bytes / (ms / 1000.0) / 1e9;
+}
+
+static PeakCalibration run_peak_calibration(float *buf) {
+    PeakCalibration cal = {0.0, "unavailable", 0, -1};
+
+    for (int s = 0; s < (int)(sizeof(CAL_SIZES)/sizeof(CAL_SIZES[0])); s++) {
+        size_t bytes = CAL_SIZES[s];
+        if (bytes > BUFFER_BYTES) continue;
+#if CUDART_VERSION >= 12020
+        cudaMemLocation loc = {cudaMemLocationTypeDevice, 0};
+        cudaMemPrefetchAsync(buf, bytes, loc, 0);
+#else
+        cudaMemPrefetchAsync(buf, bytes, 0, 0);
+#endif
+        cudaDeviceSynchronize();
+
+        for (int pass = 0; pass < CAL_PASSES; pass++) {
+            double gbps = run_gpu_bandwidth_once(buf, bytes);
+            if (pass == 0) continue; /* discard warmup */
+            if (gbps > cal.empirical_peak_gbps) {
+                cal.empirical_peak_gbps = gbps;
+                cal.best_bytes          = bytes;
+                cal.best_pass           = pass;
+                cal.peak_source         = "empirical_calibration";
+            }
+        }
+        printf("  %4zu MB → %.2f GB/s\n", bytes / 1024 / 1024,
+               cal.empirical_peak_gbps);
+    }
+    return cal;
+}
+static double load_peak_calibration(const char *path, char *source_out) {
+    FILE *fp = fopen(path, "r");
+    if (!fp) { strncpy(source_out, "unavailable", 63); return 0.0; }
+    double peak = 0.0;
+    char line[256];
+    while (fgets(line, sizeof(line), fp)) {
+        if (strstr(line, "empirical_peak_bw_gbps")) {
+            sscanf(line, " \"empirical_peak_bw_gbps\": %lf", &peak);
+        }
+    }
+    fclose(fp);
+    if (peak > 0.0) strncpy(source_out, "empirical_calibration", 63);
+    else            strncpy(source_out, "unavailable", 63);
+    return peak;
+}
+
 int main(int argc, char **argv) {
     int json_only = 0;
-    for (int i = 1; i < argc; i++)
+    int calibrate_peak = 0;
+    char peak_from[256] = "";
+    for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--json-only") == 0)
             json_only = 1;
-
+        if (strcmp(argv[i], "--calibrate-peak") == 0)
+            calibrate_peak = 1;
+        if (strcmp(argv[i], "--peak-from") == 0 && i+1 < argc)
+            strncpy(peak_from, argv[++i], 255);
+    }
+    /* Load empirical peak if provided */
+    Results r = {};
+    if (peak_from[0]) {
+        r.empirical_peak_gbps = load_peak_calibration(peak_from, r.peak_source);
+    } else {
+        strncpy(r.peak_source, "unavailable", 63);
+        r.empirical_peak_gbps = 0.0;
+    }
     int device = 0;
     CUDA_CHECK(cudaSetDevice(device));
 
     Platform p = detect_platform(device);
-    Results  r = {};
 
     if (!json_only) {
         printf("=== UMA Bandwidth Test v%s ===\n", TOOL_VERSION);
@@ -415,6 +532,21 @@ int main(int argc, char **argv) {
     CUDA_CHECK(cudaMallocManaged(&buf_b, BUFFER_BYTES));
     CUDA_CHECK(cudaMallocManaged(&sink,  sizeof(float)));
     g_sink = sink;
+
+    /* --- Calibration mode --- */
+    if (calibrate_peak) {
+        printf("=== Peak Bandwidth Calibration ===\n");
+        printf("Source: empirical runtime measurement\n");
+        printf("No spec constants. No hardcoded peak.\n\n");
+        PeakCalibration cal = run_peak_calibration(buf_a);
+        printf("\nEmpirical peak: %.3f GB/s\n", cal.empirical_peak_gbps);
+        printf("Best size     : %.2f MB\n", cal.best_bytes / 1024.0 / 1024.0);
+        printf("Best pass     : %d\n", cal.best_pass);
+        write_peak_calibration_json("peak_calibration.json", &cal);
+        printf("JSON: peak_calibration.json\n");
+        cudaFree(buf_a); cudaFree(buf_b); cudaFree(sink);
+        return 0;
+    }
 
     if (!json_only) { printf("Initializing..."); fflush(stdout); }
     memset(buf_a, 0, BUFFER_BYTES);
@@ -546,11 +678,16 @@ int main(int argc, char **argv) {
     /* --- Summary --- */
     if (!json_only) {
         printf("=== Summary ===\n");
-        printf("GPU read  : %7.2f GB/s  (%5.1f%% of %.0f GB/s peak)\n",
-               r.gpu_read.mean,
-               p.peak_bw_gbs > 0 ?
-               r.gpu_read.mean / p.peak_bw_gbs * 100.0 : 0.0,
-               p.peak_bw_gbs);
+        if (r.empirical_peak_gbps > 0.0)
+            printf("GPU read  : %7.2f GB/s  (%5.1f%% of %.3f GB/s empirical peak)\n",
+                   r.gpu_read.mean,
+                   r.gpu_read.mean / r.empirical_peak_gbps * 100.0,
+                   r.empirical_peak_gbps);
+        else
+            printf("GPU read  : %7.2f GB/s  (%5.1f%% of %.0f GB/s theoretical peak)\n",
+                   r.gpu_read.mean,
+                   p.peak_bw_gbs > 0 ? r.gpu_read.mean / p.peak_bw_gbs * 100.0 : 0.0,
+                   p.peak_bw_gbs);
         printf("GPU write : %7.2f GB/s  [PTX .cs — true DRAM]\n",
                r.gpu_write.mean);
         printf("GPU copy  : %7.2f GB/s\n", r.gpu_copy.mean);
@@ -561,6 +698,10 @@ int main(int argc, char **argv) {
         printf("JSON      : %s\n", JSON_OUTPUT);
     }
 
+    /* Compute efficiency against empirical peak */
+    r.bw_efficiency_pct = (r.empirical_peak_gbps > 0.0)
+        ? (r.gpu_read.mean / r.empirical_peak_gbps) * 100.0
+        : 0.0;
     write_json(JSON_OUTPUT, &p, &r);
     if (!json_only) printf("Done.\n");
 

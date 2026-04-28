@@ -6,3 +6,25 @@ uma_bw
 # Result files
 *.zip
 uma_*_results.json
+# Run outputs — keep locally, not in repo
+correlated_mc_*/
+events.json
+timeline.json
+uma_bw_results.json
+uma_contention_results.json
+uma_bw
+uma_contention
+peak_calibration.json
+*.zip
+# Run outputs — archived locally, not in repo
+correlated_mc_*/
+events.json
+timeline.json
+uma_bw_results.json
+uma_contention_results.json
+uma_bw
+uma_contention
+peak_calibration.json
+*.zip
+spbm_*.txt
+run_guard.log

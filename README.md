@@ -1,321 +1,305 @@
-# nvidia-uma-fault-probe
+# gb10-uma-diagnostics
 
-Ground-truth measurement of NVIDIA Unified Memory behavior.
+**Unified memory diagnostic suite for NVIDIA GB10 (DGX Spark)**
+Controlled measurement and system-level behavior classification
 
-Low-level probes for fault latency, memory bandwidth, and atomic
-coherence cost using PTX instrumentation inside the kernel.
+---
 
-All metrics are captured with `%clock64` and PTX cache/atomic scope
-operators — not CUPTI callbacks or NVML polling.
+## Overview
 
-Covers both discrete PCIe and UMA platforms.
+`gb10-uma-diagnostics` is a controlled measurement suite for analyzing unified memory behavior on GB10 systems.
 
-Written in CUDA C with inline PTX. No separate PTX files.
-No dependencies beyond CUDA. Engineers share JSON output for remote analysis.
+It performs targeted experiments to measure:
+
+- Memory bandwidth (CPU and GPU)
+- CPU–GPU contention on shared memory
+- Atomic coherence cost (system vs GPU scope)
+- Memory stall behavior under pressure
+- Power and clock response during load
+
+Measured signals are interpreted into actionable system states:
+ROOT_CAUSE: MEMORY | POWER | MEMORY+POWER | UNKNOWN
+PRESSURE:   SAFE | WARNING | CRITICAL
+
+---
+
+## Why This Exists
+
+On GB10 (DGX Spark), some key unified memory signals are not fully exposed through current APIs:
+
+- CUPTI UVM event collection — unavailable (CUPTI_ERROR_NOT_READY, CUDA 13.0, driver 580.142)
+- NVML memory clock — not exposed (returns N/A)
+- Nsight Systems UVM tracing — unsupported
+
+System-level telemetry does exist (power, clocks, memory usage, PSI), but fine-grained unified memory behavior must be inferred from controlled experiments.
+
+---
+
+## Approach
+controlled experiment → measured response → classification
+
+Rather than relying on internal driver state, behavior is derived from:
+
+- bandwidth response
+- contention patterns
+- latency
+- PSI (stall signal)
+- power and clock changes
+
+---
+
+## Diagnostic Model
+
+### Methodology
+
+**1. Controlled Experiment**
+- Defined memory access patterns
+- CPU/GPU concurrency models
+- Repeatable workload conditions
+
+**2. Measured Response**
+- Bandwidth (GB/s)
+- Latency (ns)
+- PSI (`/proc/pressure/memory`)
+- Power / clocks
+- System behavior under load
+
+**3. Classification**
+- Convert signals into system-level interpretation
+
+### Signal Interpretation
+
+Memory Contention:
+symptom:      bandwidth drop under concurrent access
+interpretation: shared memory fabric contention
+
+Memory Stall:
+symptom:      PSI (memory) rising — especially "full"
+interpretation: scheduler blocked on memory
+
+Power Limiting:
+symptom:      clock reduction under load, power plateau
+interpretation: power or thermal constraint
+
+Combined Effects:
+symptom:      bandwidth drop + PSI rise + power increase
+interpretation: contention driving both memory stall and power response
+
+### Key Principle
+
+PSI (`/proc/pressure/memory`) is the most reliable observable indicator of memory stall on GB10 systems where direct UVM telemetry is unavailable. PSI reflects time stalled, not allocation size — making it suitable for detecting failure conditions before they become unrecoverable.
+
+### Constraints
+
+- No direct UVM fault stream
+- No memory clock via NVML
+- Partial profiler support
+
+Classification is based on externally observable behavior, not internal driver state.
 
 ---
 
 ## Tools
 
-### uma_probe — UMA Fault Latency Probe
+### uma_bw — Bandwidth Probe
 
-Measures cycle-accurate memory access latency using `ld.global.cv` and
-`%clock64` inside the kernel.
+Measures CPU and GPU bandwidth using PTX-level cache operators for true DRAM measurement.
+PTX read : ld.global.cg  (L1 bypass)
+PTX write: st.global.cs  (L2 bypass — true DRAM write)
 
-Three passes expose the full UMA behavior profile:
+Flags:
+--calibrate-peak                    empirical peak BW, no hardcoded spec
+--peak-from peak_calibration.json   load peak, compute efficiency%
+--json-only
 
-| Pass     | Setup                      | Measures                        |
-|----------|----------------------------|---------------------------------|
-| COLD     | CPU touches all pages      | First-touch access cost         |
-| WARM     | GPU prefetch before launch | Resident access latency         |
-| PRESSURE | Mixed CPU/GPU residency    | Thrash latency                  |
+Build:
+```bash
+nvcc -O2 -std=c++17 -I./include uma_bandwidth_test.cu -o uma_bw -lcudart -lpthread
+```
 
-The COLD/WARM ratio is the key signal. Run the tool on your hardware — results vary by platform.
+### uma_contention — Contention Probe
 
----
+Measures bandwidth degradation under CPU/GPU simultaneous memory access.
 
-### uma_bw — UMA Bandwidth Test
+Modes:
+--mode gpu-read
+--mode gpu-write
+--mode cpu-read
+--mode cpu-write
+--mode cpu-read-gpu-read      split buffer — parallel bandwidth
+--mode cpu-write-gpu-read     same buffer — maximum contention
+--mode cpu-write-gpu-write    same buffer — both writing
+--mode sweep                  all modes (default)
+--peak-from peak_calibration.json
 
-Measures achieved memory bandwidth using PTX cache operators:
+Build:
+```bash
+nvcc -O2 -std=c++17 -I./include uma_contention.cu -o uma_contention -lcudart -lpthread
+```
 
-- `ld.global.cg` — cache at L2, bypass L1 (read)
-- `st.global.cs` — bypass L2, true DRAM write bandwidth
+### uma_atomic — Coherence Probe
 
-Tests GPU read, GPU write, GPU copy, CPU read, CPU write,
-and concurrent CPU+GPU access to the same memory pool.
+Measures atomic coherence cost on hardware-coherent UMA.
+atom.global.gpu  — GPU-scope atomic
+atom.global.sys  — system-scope atomic (NVLink-C2C coherence path)
+SYS/GPU ratio    — coherence overhead
 
-Peak bandwidth is derived from hardware attributes at runtime.
-On GB10, memory clock is not exposed by the driver; peak is
-reported as 0 rather than fabricated.
+Build:
+```bash
+nvcc -O2 -std=c++17 uma_atomic_test.cu -o uma_atomic -lcudart
+```
 
-On GB10 the concurrent test measures Grace CPU and GB10 GPU
-accessing the same LPDDR5X pool simultaneously.
+### spbm_analyzer.py — Power + Pressure Classifier
 
----
+Reads spark_hwmon sensors, nvidia-smi, and PSI live. Classifies system state in real time and writes events to `events.json`.
 
-### uma_atomic — UMA Atomic Coherence Probe
+Run:
+```bash
+python3 spbm_analyzer.py <outdir> [sparkview_anomaly_log]
+```
 
-Measures cycle-accurate latency of atomic operations at GPU scope
-vs system scope on unified managed memory.
+### run_correlated.sh — Experiment Orchestrator
 
-Three passes:
-
-| Pass       | PTX Operation             | Measures                              |
-|------------|---------------------------|---------------------------------------|
-| GPU-scope  | `atom.global.gpu.add.u32` | Atomic latency within GPU memory      |
-| SYS-scope  | `atom.global.sys.add.u32` | Atomic latency through coherence path |
-| CONTENTION | `atom.global.sys` + CPU   | True concurrent access cost           |
-
-
-The SYS/GPU ratio is the coherence signal. On discrete PCIe 
-ratio is ~1.0x (no coherence protocol). On GB10 NVLink-C2C 
-hardware coherence is transparent — first community measurement 
-shows 1.00x ratio at atomic instruction level.
-
----
-
-## Why PTX
-
-PTX (Parallel Thread Execution) is NVIDIA's virtual machine assembly.
-Inline PTX inside CUDA C is compiled natively by nvcc for the target GPU —
-no separate PTX files, no runtime JIT.
-
-- `%clock64` measures cycles inside the kernel, no driver overhead
-- Cache operators `.cg` and `.cv` control memory path behavior
-- `st.global.cs` bypasses L2, measuring true DRAM write bandwidth
-- Atomic scope operators `.gpu` and `.sys` expose coherence behavior
-- Ground truth from inside the kernel — not from callbacks
-
-Note: Nsight Systems UVM profiling is not supported on GB10 (confirmed by NVIDIA).
-These measurements provide direct visibility in its absence.
-
-References:
-- CUDA Programming Guide (Unified Memory model):
-  https://docs.nvidia.com/cuda/cuda-c-programming-guide/
-- PTX ISA (instruction-level measurement basis):
-  https://docs.nvidia.com/cuda/parallel-thread-execution/
+Runs all tools in a controlled phased experiment with shared SPBM telemetry and timestamp alignment.
+Phase 0   pre-run check (clock, temp, SWAP)
+Phase 1   uma_bw — default clocks
+Phase 2   cooldown to baseline
+Phase 3   uma_bw — capped clocks
+Phase 4   cooldown to baseline
+Phase 5   uma_contention sweep
+Phase 6   package all outputs into timestamped zip
 
 ---
 
-## Build
+## Quick Start
 
-Requirements: CUDA 12.x or 13.x, C++17, Linux (x86_64 or aarch64)
-
-### uma_probe
+### 1. Build
 
 ```bash
-# x86_64:
-nvcc -O2 -std=c++17 probe_launcher.cu -o uma_probe -lcudart -lcuda
-
-# aarch64 (GB10 DGX Spark):
-nvcc -O2 -std=c++17 probe_launcher.cu -o uma_probe -lcudart -lcuda -lpthread
+nvcc -O2 -std=c++17 -I./include uma_bandwidth_test.cu -o uma_bw -lcudart -lpthread
+nvcc -O2 -std=c++17 -I./include uma_contention.cu -o uma_contention -lcudart -lpthread
+nvcc -O2 -std=c++17 uma_atomic_test.cu -o uma_atomic -lcudart
 ```
 
-### uma_bw
+On GB10 — use CUDA 13.0 explicitly:
+```bash
+/usr/local/cuda-13.0/bin/nvcc -O2 -std=c++17 -I./include uma_bandwidth_test.cu -o uma_bw -lcudart -lpthread
+/usr/local/cuda-13.0/bin/nvcc -O2 -std=c++17 -I./include uma_contention.cu -o uma_contention -lcudart -lpthread
+```
+
+### 2. Calibrate peak bandwidth
 
 ```bash
-# x86_64:
-nvcc -O2 -std=c++17 uma_bandwidth_test.cu -o uma_bw -lcudart
-
-# aarch64 (GB10 DGX Spark):
-nvcc -O2 -std=c++17 uma_bandwidth_test.cu -o uma_bw -lcudart -lpthread
+./uma_bw --calibrate-peak
 ```
 
-### uma_atomic
+### 3. Run sparkview (recommended — in separate terminal)
 
 ```bash
-# x86_64 (SM 6.0+ required for scoped atomics):
-nvcc -O2 -std=c++17 -arch=sm_60 uma_atomic_test.cu -o uma_atomic -lcudart -lcuda
-
-# aarch64 (GB10 DGX Spark):
-nvcc -O2 -std=c++17 -arch=sm_90 uma_atomic_test.cu -o uma_atomic -lcudart -lcuda -lpthread
+cd ~/sparkview && source sparkview-venv/bin/activate && python3 main.py
 ```
 
----
-
-## Run
+### 4. Run full diagnostic
 
 ```bash
-./uma_probe              # human-readable output + JSON log
-./uma_probe --json-only  # JSON only
-
-./uma_bw                 # human-readable output + JSON log
-./uma_bw --json-only     # JSON only
-
-./uma_atomic             # human-readable output + JSON log
-./uma_atomic --json-only # JSON only
+./run_correlated.sh
 ```
 
 ---
 
-## Scripts
+## Output
 
-### run_all.sh — Run All Tools
+Each run produces a timestamped zip containing:
+uma_bw_run1.txt              default clock bandwidth
+uma_bw_run2.txt              capped clock bandwidth
+uma_contention_sweep.txt     full contention table
+uma_bw_results.json
+uma_contention_results.json
+peak_calibration.json
+spbm_*.txt                   raw power stream
+run_guard.log                thermal guard log
+events.json                  classified events
+timeline.json                nanosecond event log
+sparkview logs               if sparkview was running
 
-Runs all three probes in sequence with thermal cooldown between each.
+---
 
+## Interpreting Results
+
+### Bandwidth runs
+Run 1 vs Run 2 delta:
+large delta   → clock cap affects bandwidth (power-limited)
+small delta   → bandwidth is memory-bound, not clock-bound
+
+### Contention sweep
+cpu-write+gpu-read drop%:
+on DISCRETE_PCIE  → PCIe contention (page migration)
+on GB10 UMA       → LPDDR5X fabric arbitration
+
+### Events
+MEMORY+POWER + CRITICAL → system approaching freeze
+MEMORY only             → fabric saturated, clock still healthy
+POWER only              → clock-limited, memory headroom remains
+
+---
+
+## GB10 Confirmed Baselines
+
+From community contributors (azampatti, pontostroy) — CUDA 13.0, driver 580.142:
+GPU read idle        161–166 GB/s
+GPU write idle       115–116 GB/s
+CPU read               7.6–7.7 GB/s
+UMA fault latency     16.5 ns p50 (40 cycles)
+COLD/WARM ratio        1.00x
+
+Driver gaps confirmed:
+NVML memory clock     N/A — use --calibrate-peak
+CUPTI UVM events      CUPTI_ERROR_NOT_READY
+Peak BW from driver   0 GB/s
+
+## CUDA Version Requirement
+CUDA 13.0   confirmed working on GB10
+CUDA 13.1   %clock64 broken on GB10 — do not use
+CUDA 13.2   %clock64 returns 0, overflow — do not use
+
+## PTX Forward Compatibility
+
+All PTX instructions are generic portable primitives — no architecture-specific suffixes.
+
+Validate before running on new hardware:
 ```bash
-./run_all.sh
-```
-
-- Checks all binaries are built — exits with build instructions if not
-- Detects sparkview and launches it automatically for thermal monitoring
-- Runs uma_probe → 10s cooldown → uma_atomic → 10s cooldown → uma_bw → 30s cooldown
-- Calls collect_results.sh automatically when done
-
-If sparkview is already running when `run_all.sh` is launched, the script exits with:
-
-```
-sparkview is already running.
-Close it first for a clean session log, then rerun this script.
-```
-
-If sparkview is not installed:
-
-```
-sparkview not found — recommended for thermal monitoring.
-Install: https://github.com/parallelArchitect/sparkview
+CUDA_FORCE_PTX_JIT=1 ./uma_bw
+CUDA_FORCE_PTX_JIT=1 ./uma_contention --mode gpu-read
 ```
 
 ---
 
-### collect_results.sh — Package Results
+## Known Limitations
 
-Packages all JSON result files plus the latest sparkview anomaly log.
-
-```bash
-./collect_results.sh
-```
-
-Creates `uma_results_<hostname>_<timestamp>.zip` containing:
-- `uma_probe_results.json`
-- `uma_bw_results.json`
-- `uma_atomic_results.json`
-- `sparkview_summary.json` (if sparkview logged an anomaly)
-- `sparkview_anomaly.log.gz` (if sparkview logged an anomaly)
-
-Prompts after packaging:
-
-```
-Results packaged: uma_results_mc_20260425_021713.zip (3 of 3 tools)
-
-What would you like to do?
-  [1] Share — open GitHub Issues to upload
-  [2] Local — keep results, no upload
-```
-
-To share results with the community:
-https://github.com/parallelArchitect/nvidia-uma-fault-probe/issues
+- UVM internal state not directly observable
+- Memory clock unavailable via NVML
+- Classification based on inference from external signals
+- GB10 only — not designed for discrete PCIe platforms
 
 ---
 
-## Example Output — Pascal GTX 1080 (SM 6.1, validated)
+## Related Tools
 
-**uma_probe:**
-```
-GPU      : NVIDIA GeForce GTX 1080 (SM 6.1)
-Platform : DISCRETE_PCIE
-COLD  p50:     49.0 ns  (85 cycles)
-WARM  p50:     46.2 ns  (80 cycles)
-COLD/WARM ratio: 1.06x
-```
+- [sparkview](https://github.com/parallelArchitect/sparkview) — GB10-aware GPU monitor with PSI pressure and clock state detection
+- [nvidia-uma-fault-probe](https://github.com/parallelArchitect/nvidia-uma-fault-probe) — UMA fault latency and bandwidth (forum-facing stable version)
+- [cuda-unified-memory-analyzer](https://github.com/parallelArchitect/cuda-unified-memory-analyzer) — UMA fault counts and memory pressure diagnostics
 
-**uma_bw:**
-```
-GPU      : NVIDIA GeForce GTX 1080 (SM 6.1)
-Platform : DISCRETE_PCIE
-GPU read  : 254.90 GB/s  stddev 0.82
-GPU write : 261.69 GB/s  [PTX .cs]
-GPU copy  :   6.64 GB/s
-CPU read  :   5.23 GB/s
-CPU write :  18.26 GB/s
-Conc total: 264.16 GB/s
-```
+## Community
 
-**uma_atomic:**
-```
-GPU      : NVIDIA GeForce GTX 1080 (SM 6.1)
-Platform : DISCRETE_PCIE
-GPU-scope p50 :    187.5 ns  (325 cycles) [atom.global.gpu]
-SYS-scope p50 :    187.5 ns  (325 cycles) [atom.global.sys]
-SYS/GPU ratio : 1.00x
-Coherence cost: 0.0 ns overhead
-```
-
----
-
-## Example Output — GB10 DGX Spark (SM 12.1, validated)
-
-First community measurement, 2026-04-23. VLLM loaded, model idle.
-
-**uma_probe:**
-```
-GPU      : NVIDIA GB10 (SM 12.1)
-Platform : HARDWARE_COHERENT_UMA
-COLD  p50:     16.5 ns  (40 cycles)
-WARM  p50:     16.5 ns  (40 cycles)
-COLD/WARM ratio: 1.00x
-```
-
-**uma_bw:**
-```
-GPU      : NVIDIA GB10 (SM 12.1)
-Platform : HARDWARE_COHERENT_UMA
-GPU read  : 161.31 GB/s  stddev 2.82
-GPU write : 116.15 GB/s  [PTX .cs]
-GPU copy  : 164.45 GB/s
-CPU read  :   7.62 GB/s
-CPU write :  57.95 GB/s
-Conc total: 162.89 GB/s
-```
-
-**uma_atomic:**
-```
-GPU      : NVIDIA GB10 (SM 12.1)
-Platform : HARDWARE_COHERENT_UMA
-GPU-scope p50 :      9.9 ns  (24 cycles) [atom.global.gpu]
-SYS-scope p50 :      9.9 ns  (24 cycles) [atom.global.sys]
-SYS/GPU ratio : 1.00x
-Coherence cost: 0.0 ns overhead
-```
-
----
-
-## Supported Architectures
-
-| Architecture               | SM       | uma_probe | uma_bw    | uma_atomic |
-|----------------------------|----------|-----------|-----------|------------|
-| Pascal                     | 6.0, 6.1 | validated | validated | validated  |
-| Volta                      | 7.0      | expected  | expected  | expected   |
-| Turing                     | 7.5      | expected  | expected  | expected   |
-| Ampere                     | 8.0, 8.6 | expected  | expected  | expected   |
-| Ada Lovelace               | 8.9      | expected  | expected  | expected   |
-| Hopper                     | 9.0      | expected  | expected  | expected   |
-| Blackwell GB10 (DGX Spark) | 12.1     | validated | validated | validated  |
-| Blackwell GB202 (RTX 5090) | 12.0     | pending   | pending   | pending    |
-
----
-
-## Relationship to Other Tools
-
-| Tool                          | Measures                      | Method                       | Type           |
-|-------------------------------|-------------------------------|------------------------------|----------------|
-| uma_probe                     | Memory access latency (ns)    | PTX %clock64 + ld.global.cv  | Point-in-time  |
-| uma_bw                        | Bandwidth (GB/s)              | PTX .cg/.cs + CUDA events    | Point-in-time  |
-| uma_atomic                    | Atomic coherence latency (ns) | PTX %clock64 + atom.global   | Point-in-time  |
-| cuda-unified-memory-analyzer  | UMA pressure, fault rate, migration efficiency | CUPTI + NVML (Pascal validated; GB10 in progress) | Point-in-time  |
-| sparkview                     | System health + UMA pressure  | NVML + PSI + clock state     | Continuous monitor |
-
-These tools establish the hardware baseline. sparkview monitors the system
-continuously against that baseline and logs anomalies automatically.
-
-cuda-unified-memory-analyzer: https://github.com/parallelArchitect/cuda-unified-memory-analyzer
-sparkview: https://github.com/parallelArchitect/sparkview
-
-GB10 findings and community data:
+NVIDIA Developer Forums baseline thread:
 https://forums.developer.nvidia.com/t/gb10-hardware-baseline-first-direct-measurements-and-findings/367851
 
 ---
+
+## Author
+
+parallelArchitect
+Human-directed GPU engineering with AI assistance
 
 ## License
 

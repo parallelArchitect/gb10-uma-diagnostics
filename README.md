@@ -287,7 +287,6 @@ CUDA_FORCE_PTX_JIT=1 ./uma_contention --mode gpu-read
 
 - [sparkview](https://github.com/parallelArchitect/sparkview) — GB10-aware GPU monitor with PSI pressure and clock state detection
 - [nvidia-uma-fault-probe](https://github.com/parallelArchitect/nvidia-uma-fault-probe) — UMA fault latency and bandwidth (forum-facing stable version)
-- [cuda-unified-memory-analyzer](https://github.com/parallelArchitect/cuda-unified-memory-analyzer) — UMA fault counts and memory pressure diagnostics
 
 ## Community
 

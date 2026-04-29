@@ -25,13 +25,14 @@ PRESSURE:   SAFE | WARNING | CRITICAL
 
 ## Why This Exists
 
-On GB10 (DGX Spark), some key unified memory signals are not fully exposed through current APIs:
+On GB10 (DGX Spark), several unified memory signals are not fully exposed through current APIs:
 
-- CUPTI UVM event collection — unavailable (CUPTI_ERROR_NOT_READY, CUDA 13.0, driver 580.142)
 - NVML memory clock — not exposed (returns N/A)
 - Nsight Systems UVM tracing — unsupported
+- CUPTI UVM event collection — structurally absent on hardware-coherent UMA
 
-System-level telemetry does exist (power, clocks, memory usage, PSI), but fine-grained unified memory behavior must be inferred from controlled experiments.
+Fine-grained unified memory behavior must be inferred from controlled experiments.
+CUPTI Activity instrumentation details will be documented once GB10 validation is complete.
 
 ---
 

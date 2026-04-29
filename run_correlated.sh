@@ -10,13 +10,30 @@ OUTDIR="correlated_${HOST}_${TIMESTAMP}"
 SPBM_LOG="spbm_${HOST}_${TIMESTAMP}.txt"
 LOGFILE="$OUTDIR/run_guard.log"
 
-# GB10 (DGX Spark) only — idle clock ~208MHz
-IDLE_CLOCK_THRESHOLD=500
-THROTTLE_CLOCK_THRESHOLD=850
+# Recovery detection tuning
+# GB10: clock stays at ~2405MHz in P0 active idle — clock gating disabled on GB10
+# Recovery is detected via temp return to baseline + power stabilization
+THROTTLE_CLOCK_THRESHOLD=850   # below this under load = PROCHOT active
 MAX_WAIT_SECONDS=300
 SAMPLE_INTERVAL=5
 BASELINE_SAMPLES=5
+TEMP_MARGIN=2                  # degrees C above baseline
+POWER_MARGIN=2                 # watts variance for stability check
+STABILITY_SAMPLES=3            # consecutive samples required for stability
+
+# Baseline — measured per run in get_stable_baseline(), never hardcoded
 BASELINE_TEMP=50
+BASELINE_POWER=0
+
+# Detect GB10 — determines recovery detection path
+# GB10 P0 active idle: ~2405MHz (clock not a recovery signal)
+# Pascal idle: drops to ~135-455MHz (clock IS a recovery signal)
+IS_GB10=0
+nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | grep -q "GB10" && IS_GB10=1
+
+# Signal history arrays for stability detection
+TEMP_HISTORY=()
+POWER_HISTORY=()
 
 log() {
     echo "$(date +%s%3N) $*" >> "$LOGFILE"
@@ -46,20 +63,88 @@ get_temp() {
     nvidia-smi --query-gpu=temperature.gpu --format=csv,noheader,nounits 2>/dev/null | tr -d ' '
 }
 
+get_power() {
+    # returns integer watts — strip decimal
+    nvidia-smi --query-gpu=power.draw \
+        --format=csv,noheader,nounits 2>/dev/null | tr -d ' ' | cut -d. -f1
+}
+
+# Check if temp is still on a downward slope (still cooling)
+# Requires 3 samples — a single flat step is not sufficient
+is_cooling() {
+    if [ "${#TEMP_HISTORY[@]}" -lt 3 ]; then
+        return 0  # not enough data — assume still cooling
+    fi
+    local t1=${TEMP_HISTORY[-1]}
+    local t2=${TEMP_HISTORY[-2]}
+    local t3=${TEMP_HISTORY[-3]}
+    # downward trend across all three = still cooling
+    if [ "$t1" -le "$t2" ] && [ "$t2" -le "$t3" ]; then
+        return 0
+    fi
+    return 1  # slope has flattened
+}
+
+# Check if temp has returned to baseline range
+temp_near_baseline() {
+    if [ "${#TEMP_HISTORY[@]}" -lt 1 ]; then return 1; fi
+    local current=${TEMP_HISTORY[-1]}
+    if [ "$current" -le $((BASELINE_TEMP + TEMP_MARGIN)) ]; then
+        return 0
+    fi
+    return 1
+}
+
+# Check if power has stabilized (not oscillating)
+# Variance across last STABILITY_SAMPLES must be within POWER_MARGIN
+power_stable() {
+    if [ "${#POWER_HISTORY[@]}" -lt "$STABILITY_SAMPLES" ]; then
+        return 1
+    fi
+    local i max_diff=0
+    local prev=${POWER_HISTORY[-$STABILITY_SAMPLES]}
+    for i in "${POWER_HISTORY[@]: -$((STABILITY_SAMPLES-1))}"; do
+        local diff=$(( i - prev ))
+        [ "$diff" -lt 0 ] && diff=$(( -diff ))
+        [ "$diff" -gt "$max_diff" ] && max_diff=$diff
+        prev=$i
+    done
+    [ "$max_diff" -le "$POWER_MARGIN" ] && return 0
+    return 1
+}
+
 get_stable_baseline() {
     log "  Capturing baseline (${BASELINE_SAMPLES} samples)..."
-    local sum_clk=0 sum_tmp=0
+    local sum_clk=0 sum_tmp=0 sum_pwr=0
+    local tmp_samples=() pwr_samples=()
+
     for i in $(seq 1 $BASELINE_SAMPLES); do
-        local CLK TMP
+        local CLK TMP PWR
         CLK=$(get_clock)
         TMP=$(get_temp)
+        PWR=$(get_power)
         sum_clk=$((sum_clk + CLK))
         sum_tmp=$((sum_tmp + TMP))
+        sum_pwr=$((sum_pwr + PWR))
+        tmp_samples+=("$TMP")
+        pwr_samples+=("$PWR")
         sleep 1
     done
+
     BASELINE_CLOCK=$((sum_clk / BASELINE_SAMPLES))
     BASELINE_TEMP=$((sum_tmp / BASELINE_SAMPLES))
-    log "  Baseline clock: ${BASELINE_CLOCK}MHz  temp: ${BASELINE_TEMP}C"
+    BASELINE_POWER=$((sum_pwr / BASELINE_SAMPLES))
+
+    # Warn if baseline is unstable — system may not be settled yet
+    local tmin tmax pmin pmax
+    tmin=$(printf "%s\n" "${tmp_samples[@]}" | sort -n | head -1)
+    tmax=$(printf "%s\n" "${tmp_samples[@]}" | sort -n | tail -1)
+    pmin=$(printf "%s\n" "${pwr_samples[@]}" | sort -n | head -1)
+    pmax=$(printf "%s\n" "${pwr_samples[@]}" | sort -n | tail -1)
+
+    log "  Baseline clock: ${BASELINE_CLOCK}MHz  temp: ${BASELINE_TEMP}C  power: ${BASELINE_POWER}W"
+    [ $(( tmax - tmin )) -gt 2 ] && log "  ⚠ Temp spread $((tmax-tmin))C during baseline — system may still be settling"
+    [ $(( pmax - pmin )) -gt 5 ] && log "  ⚠ Power spread $((pmax-pmin))W during baseline — system may still be settling"
 }
 
 check_throttle_under_load() {
@@ -72,7 +157,7 @@ check_throttle_under_load() {
     kill $BW_PID 2>/dev/null
     wait $BW_PID 2>/dev/null
     if [ -n "$CLK" ] && [ "$CLK" -lt "$THROTTLE_CLOCK_THRESHOLD" ]; then
-        log "  ⚠ Throttle detected: ${CLK}MHz"
+        log "  ⚠ Throttle detected: ${CLK}MHz — PROCHOT likely active"
         return 0
     fi
     log "  ✓ No throttle: ${CLK}MHz"
@@ -80,22 +165,53 @@ check_throttle_under_load() {
 }
 
 wait_for_idle() {
-    local LABEL="$1" ELAPSED=0 TEMP_MARGIN=2
-    log "[$LABEL] Waiting for idle..."
+    local LABEL="$1" ELAPSED=0
+    # Reset signal history at start of each wait period
+    TEMP_HISTORY=()
+    POWER_HISTORY=()
+
+    log "[$LABEL] Waiting for recovery..."
+
     while true; do
-        local CLK TMP
+        local CLK TMP PWR READY=0
         CLK=$(get_clock)
         TMP=$(get_temp)
-        if [ -n "$CLK" ] && [ "$CLK" -lt "$IDLE_CLOCK_THRESHOLD" ] && \
-           [ -n "$TMP" ] && [ "$TMP" -le $((BASELINE_TEMP + TEMP_MARGIN)) ]; then
-            log "  ✓ Idle: ${CLK}MHz / ${TMP}C"
+        PWR=$(get_power)
+
+        # Accumulate signal history — keep last 5 samples
+        TEMP_HISTORY+=("$TMP")
+        POWER_HISTORY+=("$PWR")
+        [ "${#TEMP_HISTORY[@]}"  -gt 5 ] && TEMP_HISTORY=("${TEMP_HISTORY[@]: -5}")
+        [ "${#POWER_HISTORY[@]}" -gt 5 ] && POWER_HISTORY=("${POWER_HISTORY[@]: -5}")
+
+        if [ "$IS_GB10" -eq 1 ]; then
+            # GB10 recovery model:
+            # Clock stays at ~2405MHz in P0 — not a recovery signal
+            # Recovery = temp returned to baseline AND slope flattened AND power stable
+            # Power drops fast (electrical), temp lags (thermal inertia)
+            # Both must confirm before declaring recovery
+            if temp_near_baseline && ! is_cooling && power_stable; then
+                READY=1
+            fi
+        else
+            # Pascal: clock drop is a reliable idle signal
+            if [ -n "$CLK" ] && [ "$CLK" -lt 500 ] && \
+               [ -n "$TMP" ] && [ "$TMP" -le $((BASELINE_TEMP + TEMP_MARGIN)) ]; then
+                READY=1
+            fi
+        fi
+
+        if [ "$READY" -eq 1 ]; then
+            log "  ✓ Recovered: ${CLK}MHz / ${TMP}C / ${PWR}W"
             break
         fi
+
         if [ "$ELAPSED" -ge "$MAX_WAIT_SECONDS" ]; then
             log "  ⚠ Timeout — proceeding"
             break
         fi
-        echo "$(date +%s%3N)  CLK=${CLK}MHz TMP=${TMP}C (${ELAPSED}s)" >> "$LOGFILE"
+
+        echo "$(date +%s%3N)  CLK=${CLK}MHz TMP=${TMP}C PWR=${PWR}W (${ELAPSED}s)" >> "$LOGFILE"
         sleep "$SAMPLE_INTERVAL"
         ELAPSED=$((ELAPSED + SAMPLE_INTERVAL))
     done
@@ -104,7 +220,7 @@ wait_for_idle() {
 get_uma_pressure() {
     local LOG="$SV_ANOMALY"
     if [ -f "$LOG" ]; then
-        tail -n 20 "$LOG" | awk '''/PSI:/ {
+        tail -n 20 "$LOG" | awk '/PSI:/ {
             for(i=1;i<=NF;i++){
                 if($i=="some") some=$(i+1)
                 if($i=="full") full=$(i+1)
@@ -113,17 +229,18 @@ get_uma_pressure() {
         END {
             if (some != "" && full != "")
                 printf "some %s full %s", some, full
-        }'''
+        }'
     fi
 }
 
 pre_run_check() {
-    local CLK TMP
+    local CLK TMP PWR
     CLK=$(get_clock)
     TMP=$(get_temp)
+    PWR=$(get_power)
     echo ""
     echo "=== Pre-run system check ==="
-    echo "  Clock: ${CLK}MHz  Temp: ${TMP}C"
+    echo "  Clock: ${CLK}MHz  Temp: ${TMP}C  Power: ${PWR}W"
 
     local SWAP_PCT
     SWAP_PCT=$(free | awk '/Swap/{if($2>0) printf "%.0f", $3/$2*100; else print "0"}')
@@ -133,12 +250,12 @@ pre_run_check() {
         exit 1
     fi
 
-    if [ -n "$CLK" ] && [ "$CLK" -ge "$IDLE_CLOCK_THRESHOLD" ]; then
-        echo "  Waiting for idle..."
-        BASELINE_TEMP=${TMP:-50}
-        wait_for_idle "pre-run"
-    fi
+    # Seed baseline before first wait so recovery detection has a reference
+    BASELINE_TEMP=${TMP:-50}
+    BASELINE_POWER=${PWR:-30}
+    wait_for_idle "pre-run"
 
+    # Measure proper baseline after initial recovery
     get_stable_baseline
 
     if check_throttle_under_load; then
@@ -148,9 +265,7 @@ pre_run_check() {
 
     local UMA
     UMA=$(get_uma_pressure)
-    if [ -n "$UMA" ]; then
-        echo "  UMA  : $UMA"
-    fi
+    [ -n "$UMA" ] && echo "  UMA  : $UMA"
     echo "  ✓ System ready."
 }
 
@@ -162,7 +277,7 @@ echo ""
 
 if [ ! -f "./uma_bw" ]; then
     echo "Error: uma_bw not found."
-    echo "Build: nvcc -O2 -std=c++17 -I./include uma_bandwidth_test.cu -o uma_bw -lcudart -lpthread"
+    echo "Build: /usr/local/cuda-13.0/bin/nvcc -O2 -std=c++17 -I./include uma_bandwidth_test.cu -o uma_bw -lcudart -lpthread"
     exit 1
 fi
 
@@ -236,7 +351,7 @@ wait $SPBM_PID 2>/dev/null
 nvidia-smi -rgc > /dev/null 2>&1
 wait_for_idle "post-run2"
 
-# --- Phase 5: contention sweep ---
+# --- Contention sweep ---
 echo ""
 echo "=== Contention sweep ==="
 if [ ! -f "./uma_contention" ]; then
@@ -295,8 +410,8 @@ echo "  [2] Local — keep results"
 echo ""
 read -p "Enter 1 or 2: " CHOICE
 if [ "$CHOICE" = "1" ]; then
-    xdg-open "https://github.com/parallelArchitect/nvidia-uma-fault-probe/issues/new" 2>/dev/null || \
-    echo "Go to: https://github.com/parallelArchitect/nvidia-uma-fault-probe/issues/new"
+    xdg-open "https://github.com/parallelArchitect/gb10-uma-diagnostics/issues/new" 2>/dev/null || \
+    echo "Go to: https://github.com/parallelArchitect/gb10-uma-diagnostics/issues/new"
 else
     echo "Done: $(pwd)/${OUTDIR}.zip"
 fi

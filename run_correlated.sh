@@ -172,11 +172,39 @@ wait_for_idle() {
 
     log "[$LABEL] Waiting for recovery..."
 
+    local CLK TMP PWR
+    CLK=$(get_clock)
+    TMP=$(get_temp)
+    PWR=$(get_power)
+
+    if [ "$IS_GB10" -eq 1 ]; then
+        # GB10 fast-path pre-check:
+        # If system is already at baseline on entry — pass immediately.
+        # Handles well-cooled units (external fan) where recovery is
+        # instantaneous and history buildup would cause false timeout.
+        # Works for both paths:
+        #   external fan → already recovered, pass immediately
+        #   stock unit   → not recovered, fall through to history loop
+        local ALREADY_RECOVERED=0
+        awk "BEGIN {
+            t=$TMP; p=$PWR
+            bt=$BASELINE_TEMP; bp=$BASELINE_POWER
+            tm=$TEMP_MARGIN; pm=$POWER_MARGIN
+            pdiff = p - bp; if (pdiff < 0) pdiff = -pdiff
+            if (t <= bt + tm && pdiff <= pm) exit 0
+            exit 1
+        }" && ALREADY_RECOVERED=1
+        if [ "$ALREADY_RECOVERED" -eq 1 ]; then
+            log "  ✓ Recovered immediately: ${CLK}MHz / ${TMP}C / ${PWR}W"
+            return 0
+        fi
+    fi
+
     while true; do
-        local CLK TMP PWR READY=0
         CLK=$(get_clock)
         TMP=$(get_temp)
         PWR=$(get_power)
+        local READY=0
 
         # Accumulate signal history — keep last 5 samples
         TEMP_HISTORY+=("$TMP")

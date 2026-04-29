@@ -79,7 +79,7 @@ is_cooling() {
     local t2=${TEMP_HISTORY[-2]}
     local t3=${TEMP_HISTORY[-3]}
     # downward trend across all three = still cooling
-    if [ "$t1" -le "$t2" ] && [ "$t2" -le "$t3" ]; then
+    if [ "$t1" -lt "$t2" ] && [ "$t2" -lt "$t3" ]; then
         return 0
     fi
     return 1  # slope has flattened

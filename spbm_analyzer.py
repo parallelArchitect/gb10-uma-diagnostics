@@ -210,11 +210,43 @@ SENSOR_PATTERNS = {
 
 def parse_sensors_block(block):
     parsed = {}
-    for field, pattern in SENSOR_PATTERNS.items():
-        m = pattern.search(block)
-        if m:
-            parsed[field] = float(m.group(1))
+
+    # Detection layer — check if spark_hwmon (spbm) is present
+    spbm_present = "spbm" in block.lower()
+
+    if spbm_present:
+        # Full spark_hwmon path — all channels available
+        for field, pattern in SENSOR_PATTERNS.items():
+            m = pattern.search(block)
+            if m:
+                parsed[field] = float(m.group(1))
+    else:
+        # Fallback path — acpitz only, no power channels
+        # Collect all temp values from acpitz block
+        acpitz_temps = []
+        in_acpitz = False
+        for line in block.splitlines():
+            if "acpitz" in line.lower():
+                in_acpitz = True
+            elif in_acpitz and line.strip() == "":
+                in_acpitz = False
+            if in_acpitz:
+                m = re.search(r'\+([0-9]+\.[0-9]+)', line)
+                if m:
+                    acpitz_temps.append(float(m.group(1)))
+
+        if acpitz_temps:
+            # Map generically — highest observed temp as platform thermal indicator
+            parsed["_acpitz_max"]      = max(acpitz_temps)
+            parsed["_acpitz_min"]      = min(acpitz_temps)
+            parsed["_acpitz_mean"]     = round(sum(acpitz_temps) / len(acpitz_temps), 1)
+            parsed["_acpitz_zones"]    = len(acpitz_temps)
+            parsed["_power_available"] = 0.0
+        else:
+            parsed["_power_available"] = 0.0
+
     return parsed
+
 # ──────────────────────────────────────────────────────────────────────────────
 
 # ─── NVIDIA-SMI POLLER ────────────────────────────────────────────────────────
@@ -460,14 +492,56 @@ def analyze():
 # ──────────────────────────────────────────────────────────────────────────────
 
 # ─── SENSORS THREAD ───────────────────────────────────────────────────────────
+def read_hwmon_sysfs():
+    """Read thermal zones directly from sysfs — no lm-sensors dependency.
+    Returns dict with _acpitz_* fields populated from /sys/class/hwmon/.
+    Works on any GB10 unit regardless of lm-sensors install state."""
+    parsed = {}
+    acpitz_temps = []
+    try:
+        hwmon_base = "/sys/class/hwmon"
+        for hwmon_dir in sorted(os.listdir(hwmon_base)):
+            hwmon_path = os.path.join(hwmon_base, hwmon_dir)
+            name_file = os.path.join(hwmon_path, "name")
+            if not os.path.exists(name_file):
+                continue
+            with open(name_file) as f:
+                name = f.read().strip().lower()
+            if "acpitz" not in name:
+                continue
+            for entry in sorted(os.listdir(hwmon_path)):
+                if not entry.startswith("temp") or not entry.endswith("_input"):
+                    continue
+                try:
+                    with open(os.path.join(hwmon_path, entry)) as f:
+                        millideg = int(f.read().strip())
+                    acpitz_temps.append(millideg / 1000.0)
+                except Exception:
+                    continue
+    except Exception:
+        pass
+    if acpitz_temps:
+        parsed["_acpitz_max"]      = max(acpitz_temps)
+        parsed["_acpitz_min"]      = min(acpitz_temps)
+        parsed["_acpitz_mean"]     = round(sum(acpitz_temps) / len(acpitz_temps), 1)
+        parsed["_acpitz_zones"]    = len(acpitz_temps)
+        parsed["_power_available"] = 0.0
+    return parsed
+
+
 def sensors_thread():
     global running
     while running:
         try:
-            out = subprocess.check_output(
-                ["sensors"], timeout=2
-            ).decode()
-            parsed = parse_sensors_block(out)
+            parsed = read_hwmon_sysfs()
+            try:
+                out = subprocess.check_output(
+                    ["sensors"], timeout=2
+                ).decode()
+                sensors_parsed = parse_sensors_block(out)
+                parsed.update(sensors_parsed)
+            except Exception:
+                pass
             with lock:
                 state["ts"] = ts_ms()
                 for k, v in parsed.items():
@@ -483,6 +557,7 @@ def sensors_thread():
         except Exception:
             pass
         time.sleep(0.2)
+
 # ──────────────────────────────────────────────────────────────────────────────
 
 # ─── SPARKVIEW LOG WATCHER ────────────────────────────────────────────────────

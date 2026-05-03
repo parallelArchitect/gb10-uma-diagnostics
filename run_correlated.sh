@@ -64,9 +64,28 @@ get_temp() {
 }
 
 get_power() {
-    # returns integer watts — strip decimal
-    nvidia-smi --query-gpu=power.draw \
-        --format=csv,noheader,nounits 2>/dev/null | tr -d ' ' | cut -d. -f1
+    # Try nvidia-smi first — works on Pascal, returns N/A on GB10 without spark_hwmon
+    local val
+    val=$(nvidia-smi --query-gpu=power.draw \
+        --format=csv,noheader,nounits 2>/dev/null | tr -d ' ' | cut -d. -f1)
+    if [ -n "$val" ] && [ "$val" != "N" ]; then
+        echo "$val"
+        return
+    fi
+    # Fallback: spark_hwmon sysfs — GB10 with spark_hwmon installed
+    local hwmon_path
+    hwmon_path=$(grep -rl "^spbm$" /sys/class/hwmon/*/name 2>/dev/null | head -1 | xargs dirname 2>/dev/null)
+    if [ -n "$hwmon_path" ]; then
+        local pwr_file="${hwmon_path}/power1_input"
+        if [ -f "$pwr_file" ]; then
+            # power1_input is in microwatts — convert to watts integer
+            local uw
+            uw=$(cat "$pwr_file" 2>/dev/null)
+            echo $(( uw / 1000000 ))
+            return
+        fi
+    fi
+    echo "N/A"
 }
 
 # Check if temp is still on a downward slope (still cooling)
@@ -103,7 +122,9 @@ power_stable() {
     fi
     local i max_diff=0
     local prev=${POWER_HISTORY[-$STABILITY_SAMPLES]}
+    [[ "$prev" =~ ^[0-9]+$ ]] || return 0
     for i in "${POWER_HISTORY[@]: -$((STABILITY_SAMPLES-1))}"; do
+        [[ "$i" =~ ^[0-9]+$ ]] || return 0
         local diff=$(( i - prev ))
         [ "$diff" -lt 0 ] && diff=$(( -diff ))
         [ "$diff" -gt "$max_diff" ] && max_diff=$diff
@@ -125,7 +146,7 @@ get_stable_baseline() {
         PWR=$(get_power)
         sum_clk=$((sum_clk + CLK))
         sum_tmp=$((sum_tmp + TMP))
-        sum_pwr=$((sum_pwr + PWR))
+        [[ "$PWR" =~ ^[0-9]+$ ]] && sum_pwr=$((sum_pwr + PWR)) || sum_pwr=-1
         tmp_samples+=("$TMP")
         pwr_samples+=("$PWR")
         sleep 1
@@ -133,7 +154,11 @@ get_stable_baseline() {
 
     BASELINE_CLOCK=$((sum_clk / BASELINE_SAMPLES))
     BASELINE_TEMP=$((sum_tmp / BASELINE_SAMPLES))
-    BASELINE_POWER=$((sum_pwr / BASELINE_SAMPLES))
+    if [ "$sum_pwr" -ge 0 ] 2>/dev/null; then
+        BASELINE_POWER=$((sum_pwr / BASELINE_SAMPLES))
+    else
+        BASELINE_POWER="N/A"
+    fi
 
     # Warn if baseline is unstable — system may not be settled yet
     local tmin tmax pmin pmax
@@ -280,7 +305,7 @@ pre_run_check() {
 
     # Seed baseline before first wait so recovery detection has a reference
     BASELINE_TEMP=${TMP:-50}
-    BASELINE_POWER=${PWR:-30}
+    BASELINE_POWER=${PWR:-N/A}
     wait_for_idle "pre-run"
 
     # Measure proper baseline after initial recovery
